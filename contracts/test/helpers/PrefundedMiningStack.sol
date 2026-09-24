@@ -99,9 +99,32 @@ abstract contract PrefundedMiningStack is Test {
     uint256 internal cid;
     uint256 internal seed;
 
+    // S9 (VLT-60) old-custody depositors for cutover tests (TEST-ONLY).
+    address internal constant OLD_MATURED = address(0x01D1);
+    address internal constant OLD_RECENT = address(0x01D2);
+    address internal constant OLD_IDLE = address(0x01D3);
+    address internal constant OLD_MATURED_WALLET = address(0x01E1);
+    address internal constant OLD_RECENT_WALLET = address(0x01E2);
+    /// @dev Unstaked wallet that mines the old custody's live proofs.
+    address internal constant OLD_SOLO = address(0x0150);
+    uint256 internal constant OLD_MATURED_STAKE = 3_000e18;
+    uint256 internal constant OLD_RECENT_STAKE = 2_000e18;
+    uint256 internal constant OLD_IDLE_STAKE = 1_500e18;
+
     function setUp() public virtual {
         vm.roll(1_000);
         vm.warp(100);
+        _buildStack(STOP);
+    }
+
+    /// @dev Deploys the whole real stack (registry through old custody) with
+    /// `miningStopMultisig` as the core's immutable `MINING_STOP_MULTISIG`,
+    /// and points every harness variable at it. `setUp` calls it with the
+    /// `STOP` EOA; a test may call it again (S9) to get a SECOND, fully
+    /// independent real stack — own core, NFT, lifecycle, reserve, token and
+    /// old custody — governed by a contract multisig. Resets `module`.
+    function _buildStack(address miningStopMultisig) internal {
+        module = PrefundedMiningPower(address(0));
         registry = new BasketRegistry(address(this));
         basket = address(new HunterBasketFixture());
         registry.admitBasket(basket, keccak256("review"));
@@ -125,7 +148,7 @@ abstract contract PrefundedMiningStack is Test {
             type(uint256).max / 2,
             block.number + 3,
             3,
-            STOP,
+            miningStopMultisig,
             block.timestamp + 30 days,
             HunterMiningCore.ProofNftDeploymentData(
                 address(registry), address(lifecycle), 1, address(this), "ipfs://hunters/"
@@ -183,6 +206,7 @@ abstract contract PrefundedMiningStack is Test {
         oldCustody = new MiningPowerCustody(address(token), address(core), CURVE_UNIT);
         assertEq(address(core.miningPower()), address(0));
         assertFalse(oldCustody.wired());
+        assertEq(core.MINING_STOP_MULTISIG(), miningStopMultisig);
     }
 
     /// @dev Syncs `cid`/`seed` to the core and makes the seed blockhash
@@ -242,6 +266,58 @@ abstract contract PrefundedMiningStack is Test {
         vm.prank(STOP);
         core.setMiningPower(IMiningPower(address(0)));
         assertEq(address(core.miningPower()), address(0));
+    }
+
+    /// @dev Stop multisig (the `STOP` EOA) wires the OLD custody (S9).
+    function _attachOld() internal {
+        _attach(IMiningPower(address(oldCustody)));
+        assertTrue(oldCustody.wired());
+    }
+
+    /// @dev Mints `amt` fixture HUNTER to `who` and deposits it into the OLD custody.
+    function _oldDeposit(address who, uint256 amt) internal {
+        token.mint(who, amt);
+        vm.startPrank(who);
+        token.approve(address(oldCustody), amt);
+        oldCustody.deposit(amt);
+        vm.stopPrank();
+    }
+
+    /// @dev `who` assigns `amt` of its old-custody stake to `wallet` (needs
+    /// the old custody wired).
+    function _oldAssign(address who, address wallet, uint256 amt) internal {
+        vm.prank(who);
+        oldCustody.assign(wallet, amt);
+    }
+
+    /// @dev S9 old-custody population on an ATTACHED old custody:
+    /// - OLD_MATURED assigns `OLD_MATURED_STAKE` to OLD_MATURED_WALLET, then
+    ///   `UNLOCK_DELAY_PROOFS` (12) live proofs are mined (by the unstaked
+    ///   OLD_SOLO — the old module is optional power, never a gate), so its
+    ///   unlock delay is met;
+    /// - OLD_RECENT assigns `OLD_RECENT_STAKE` to OLD_RECENT_WALLET after
+    ///   those proofs (within the last 12), so it still waits 12 more;
+    /// - OLD_IDLE deposits `OLD_IDLE_STAKE` and never assigns.
+    /// Returns the core's accepted-proof count at the end (the RECENT
+    /// assignment's proof index).
+    function _mixedOldDepositors() internal returns (uint256 proofs) {
+        require(address(core.miningPower()) == address(oldCustody), "old custody not attached");
+        _oldDeposit(OLD_MATURED, OLD_MATURED_STAKE);
+        _oldDeposit(OLD_RECENT, OLD_RECENT_STAKE);
+        _oldDeposit(OLD_IDLE, OLD_IDLE_STAKE);
+        _oldAssign(OLD_MATURED, OLD_MATURED_WALLET, OLD_MATURED_STAKE);
+        uint256 maturedAt = oldCustody.assignProofIndex(OLD_MATURED);
+        uint256 delay = oldCustody.UNLOCK_DELAY_PROOFS();
+        for (uint256 i = 0; i < delay; i++) {
+            _win(OLD_SOLO);
+        }
+        _oldAssign(OLD_RECENT, OLD_RECENT_WALLET, OLD_RECENT_STAKE);
+        proofs = core.acceptedProofs();
+        assertEq(oldCustody.lastAcceptedProofs(), proofs);
+        assertGe(proofs, maturedAt + delay, "MATURED not matured");
+        assertEq(oldCustody.assignProofIndex(OLD_RECENT), proofs);
+        assertEq(oldCustody.unassignedOf(OLD_IDLE), OLD_IDLE_STAKE);
+        assertEq(oldCustody.totalAssigned(), OLD_MATURED_STAKE + OLD_RECENT_STAKE);
     }
 
     /// @dev Deploys the module under test against `token` and `core` and

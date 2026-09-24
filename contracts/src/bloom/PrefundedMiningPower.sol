@@ -360,6 +360,11 @@ contract PrefundedMiningPower is IMiningPower, ReentrancyGuard {
     /// none). Removals queued in that epoch may already have been withdrawn,
     /// so they no longer count if the module is re-wired into it.
     uint256 public holdWaivedEpoch;
+    /// @notice Latest challenge this module was re-wired into after a detach
+    /// (0 = never): `snapshotChallenge` found it already open. Wallets frozen
+    /// in that epoch before the detach are re-frozen DOWNWARD on every later
+    /// read (see `_freeze`).
+    uint256 public rewiredEpoch;
 
     /// @dev Per-token commitments, keyed by the NFT token id.
     mapping(uint256 => Lock) internal _committed;
@@ -456,7 +461,11 @@ contract PrefundedMiningPower is IMiningPower, ReentrancyGuard {
         if (!wired && totalAssigned != 0) revert RetainedAssignments(totalAssigned);
         if (_challengeOpen[challengeId]) {
             if (wired) revert AlreadySnapshotted(challengeId);
-            // Re-wired during a challenge it already opened — epoch data intact.
+            // Re-wired during a challenge it already opened — epoch data
+            // intact, but the detach waived the hold, so a wallet frozen
+            // before it may carry stake that has since left: re-freeze
+            // downward (`rewiredEpoch`, see `_freeze`).
+            rewiredEpoch = challengeId;
         } else {
             _challengeOpen[challengeId] = true;
             latestChallengeId = challengeId;
@@ -1001,10 +1010,34 @@ contract PrefundedMiningPower is IMiningPower, ReentrancyGuard {
     /// The first read for (challengeId, wallet) records the stake that was
     /// matured when the challenge opened: assigns made after opening are
     /// pending (excluded) and matured removals made after opening are added
-    /// back. Later reads return the recorded value unchanged.
+    /// back. Later reads return the recorded value unchanged — except in a
+    /// re-wired epoch (S9, VLT-60): a detach waives the stake hold
+    /// (`holdWaivedEpoch`), so matured stake removed in the open epoch may
+    /// already have left the module, and a wallet frozen BEFORE the detach
+    /// keeps a value that may include stake no longer here. When the module
+    /// is re-wired into that same epoch (`rewiredEpoch`), every read of an
+    /// already-frozen wallet therefore re-freezes it to
+    /// `min(cached, _maturedStake)` — lowering only, never raising: stake
+    /// that arrived after the challenge opened stays pending, exactly as for
+    /// a first freeze. Only while that epoch is still the latest one (older
+    /// epochs' buckets are retagged and no longer describe them).
+    /// Defence in depth: the real `HunterMiningCore` calls the freezing hook
+    /// only inside `submitProof`, and an accepted proof always opens the next
+    /// challenge, so it never leaves a cached freeze for the challenge a
+    /// re-wire lands in.
     function _freeze(uint256 challengeId, address miningWallet) private returns (uint256 frozen) {
         if (!_challengeOpen[challengeId]) revert ChallengeNotOpen(challengeId);
-        if (_frozen[challengeId][miningWallet]) return _frozenStake[challengeId][miningWallet];
+        if (_frozen[challengeId][miningWallet]) {
+            frozen = _frozenStake[challengeId][miningWallet];
+            if (challengeId == rewiredEpoch && challengeId == latestChallengeId) {
+                uint256 matured = _maturedStake(challengeId, miningWallet);
+                if (frozen > matured) {
+                    frozen = matured;
+                    _frozenStake[challengeId][miningWallet] = matured;
+                }
+            }
+            return frozen;
+        }
         // A never-frozen challenge can only be reconstructed for the latest
         // epoch — older balances are no longer derivable once buckets settle,
         // so refuse rather than permanently record a wrong snapshot.
@@ -1015,11 +1048,17 @@ contract PrefundedMiningPower is IMiningPower, ReentrancyGuard {
     }
 
     /// @dev Read-only twin of `_freeze` for `latestChallengeId`: the recorded
-    /// value if the wallet was already frozen, else what `_freeze` would record.
+    /// value if the wallet was already frozen (lowered to the matured stake in
+    /// a re-wired epoch, as `_freeze` would), else what `_freeze` would record.
     function _frozenPreview(address miningWallet) private view returns (uint256) {
         uint256 challengeId = latestChallengeId;
-        if (_frozen[challengeId][miningWallet]) return _frozenStake[challengeId][miningWallet];
-        return _maturedStake(challengeId, miningWallet);
+        uint256 matured = _maturedStake(challengeId, miningWallet);
+        if (_frozen[challengeId][miningWallet]) {
+            uint256 cached = _frozenStake[challengeId][miningWallet];
+            if (challengeId == rewiredEpoch && cached > matured) return matured;
+            return cached;
+        }
+        return matured;
     }
 
     /// @dev Stake matured for `challengeId` (the latest epoch): assigns made
