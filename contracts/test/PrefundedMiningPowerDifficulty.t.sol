@@ -72,6 +72,11 @@ contract PrefundedMiningPowerDifficultyTest is Test {
     /// forge-config: default.fuzz.runs = 24
     /// forge-config: release.fuzz.runs = 24
     function testFuzz_DifficultyMatchesUngatedCore(uint256 seed) public {
+        // S6: every accepted proof locks LOCK of the miner's mint funds;
+        // funded before attach so the funds count from the first challenge.
+        _fundBeforeAttach(module, ALICE, STEPS * LOCK);
+        _fundBeforeAttach(module, BOB, STEPS * LOCK);
+        _fundBeforeAttach(module, CAROL, STEPS * LOCK);
         _attach(coreP, module);
         _attach(coreD, dummy);
         _assertTwins();
@@ -144,6 +149,7 @@ contract PrefundedMiningPowerDifficultyTest is Test {
         assertEq(coreP.acceptedProofs(), 2);
         assertEq(coreP.activeChallengeId(), 3);
 
+        _fundBeforeAttach(module, CAROL, LOCK); // S6 mint funds
         _attach(coreP, module);
         assertTrue(module.wired());
         assertFalse(module.retired());
@@ -186,6 +192,7 @@ contract PrefundedMiningPowerDifficultyTest is Test {
 
         // Fresh module on the twin core, then mint-out retires it.
         PrefundedMiningPower mintedOut = _module(address(coreD), 0);
+        _fundBeforeAttach(mintedOut, ALICE, LOCK); // S6 mint funds
         _attach(coreD, mintedOut);
         // Boundary fixture skips prior history; no production setter exists.
         coreD.setCounts(4_999, 4_999);
@@ -193,6 +200,8 @@ contract PrefundedMiningPowerDifficultyTest is Test {
         _mineOne(coreD, ALICE);
         assertEq(uint256(coreD.challengeState()), uint256(HunterMiningCore.ChallengeState.ENDED));
         assertEq(mintedOut.lastAcceptedProofs(), 5_000);
+        (uint256 locked,,,,) = mintedOut.committedOf(5_000);
+        assertEq(locked, LOCK);
         assertFalse(mintedOut.wired());
         assertTrue(mintedOut.retired());
     }
@@ -241,6 +250,7 @@ contract PrefundedMiningPowerDifficultyTest is Test {
         // CURVE_UNIT == 0 → exactly 1.0x through the real submitProof path:
         // a digest just above the base target is rejected against the base
         // target itself (no widening), one inside it mints.
+        _fundBeforeAttach(module, ALICE, LOCK); // S6 mint funds
         _attach(coreP, module);
         _activate(coreP);
         uint256 baseTarget = coreP.currentTarget();
@@ -274,6 +284,7 @@ contract PrefundedMiningPowerDifficultyTest is Test {
 
         // With no stake ledger yet, even a curve-enabled module feeds the core
         // the 1.0x base: an above-target digest still fails at the base target.
+        _fundBeforeAttach(curved, ALICE, LOCK); // S6 mint funds
         _attach(coreD, curved);
         _activate(coreD);
         uint256 baseD = coreD.currentTarget();
@@ -304,6 +315,15 @@ contract PrefundedMiningPowerDifficultyTest is Test {
 
     function _module(address core, uint256 curveUnit) private returns (PrefundedMiningPower) {
         return new PrefundedMiningPower(address(token), core, 0, LOCK, 1 days, curveUnit, address(0));
+    }
+
+    /// @dev S6: fixture HUNTER (dealt; the token has no mint) funds `wallet`
+    /// on `m` before it is attached, so the funds count from the attach
+    /// challenge on.
+    function _fundBeforeAttach(PrefundedMiningPower m, address wallet, uint256 amount) private {
+        deal(address(token), address(this), amount, true);
+        token.approve(address(m), amount);
+        m.fund(wallet, amount);
     }
 
     function _attach(HunterMiningHarness core, IMiningPower power) private {

@@ -317,6 +317,30 @@ abstract contract PrefundedMiningStack is Test {
         _activate();
     }
 
+    /// @dev FUNDER mints `amount` fixture HUNTER and funds `wallet` with it
+    /// (mint funds belong to the wallet). The wallet is tracked so
+    /// `_assertBooks` can prove the funds sum. Funds are pending for the
+    /// open challenge and count from the next snapshot.
+    function _fund(address wallet, uint256 amount) internal {
+        _trackWallet(wallet);
+        token.mint(FUNDER, amount);
+        vm.startPrank(FUNDER);
+        token.approve(address(module), amount);
+        module.fund(wallet, amount);
+        vm.stopPrank();
+    }
+
+    /// @dev `_qualify` plus mint funds: `depositor` stakes `stake` for
+    /// `wallet` and FUNDER funds it with `funds`, both before the next
+    /// challenge opens, so both have matured once it is activated.
+    function _qualifyAndFund(address depositor, address wallet, uint256 stake, uint256 funds) internal {
+        _deposit(depositor, stake);
+        _assign(depositor, wallet, stake);
+        _fund(wallet, funds);
+        _nextChallenge();
+        _activate();
+    }
+
     /// @dev Expects the next call to revert with the gate's `NotEligible(reason)`.
     function _expectNotEligible(uint8 reason) internal {
         vm.expectRevert(abi.encodeWithSelector(PrefundedMiningPower.NotEligible.selector, reason));
@@ -330,8 +354,11 @@ abstract contract PrefundedMiningStack is Test {
     /// assigned stake sums to `totalAssigned` and equals the sum of its
     /// backers' `assignedBy`; a depositor's held stake never exceeds what
     /// it still has in the module and `withdrawableOf` is exactly the unheld
-    /// unassigned part). Only exact while all ledger calls go through
-    /// the tracking helpers (or `_trackDepositor` / `_trackWallet`).
+    /// unassigned part). Mint funds: tracked wallets' `fundsOf` sum to
+    /// `totalFunds`, live pending funds never exceed `fundsOf`, and the
+    /// unreleased locks over every minted token id sum to `totalCommitted`.
+    /// Only exact while all ledger calls go through the tracking helpers
+    /// (or `_trackDepositor` / `_trackWallet`).
     function _assertBooks() internal view virtual {
         assertEq(token.balanceOf(address(oldCustody)), oldCustody.totalLocked(), "old custody books");
         assertLe(oldCustody.totalAssigned(), oldCustody.totalLocked(), "old custody over-assigned");
@@ -377,5 +404,29 @@ abstract contract PrefundedMiningStack is Test {
             assertEq(backers, module.assignedOf(w), "wallet != sum of backers");
         }
         assertEq(assignedSum, module.totalAssigned(), "wallet sums != totalAssigned");
+
+        uint256 fundsSum;
+        for (uint256 j = 0; j < trackedWallets.length; j++) {
+            address w = trackedWallets[j];
+            uint256 walletFunds = module.fundsOf(w);
+            fundsSum += walletFunds;
+            uint256 eligibleFunds = module.eligibleFundsOf(w);
+            assertLe(eligibleFunds, walletFunds, "eligible funds > funds");
+            if (module.fundsEpoch(w) == module.latestChallengeId()) {
+                assertLe(module.pendingFunds(w), walletFunds, "pending funds > funds");
+                assertEq(eligibleFunds, walletFunds - module.pendingFunds(w), "eligible != funds - pending");
+            } else {
+                assertEq(eligibleFunds, walletFunds, "stale pending still excluded");
+            }
+        }
+        assertEq(fundsSum, module.totalFunds(), "wallet funds != totalFunds");
+
+        uint256 committedSum;
+        uint256 minted = nft.mintedEver();
+        for (uint256 id = 1; id <= minted; id++) {
+            (uint256 amount,,,, bool released) = module.committedOf(id);
+            if (!released) committedSum += amount;
+        }
+        assertEq(committedSum, module.totalCommitted(), "unreleased locks != totalCommitted");
     }
 }

@@ -319,6 +319,10 @@ contract PrefundedMiningPowerLedgerTest is PrefundedMiningStack {
     /// @dev The cooldown is wall-clock only: with zero proofs accepted it
     /// unlocks on time, and a burst of real proofs never shortens it.
     function testCooldownIsPerDepositorAndProofIndependent() public {
+        // S6: OUTSIDER's 13 wins each lock LOCK of mint funds; fund it and
+        // let the funds mature (refresh opens a challenge, no proof, no warp).
+        _fund(OUTSIDER, 13 * LOCK);
+        _nextChallenge();
         assertEq(core.acceptedProofs(), 0);
         assertEq(module.lastAcceptedProofs(), 0);
         uint256 t0 = block.timestamp;
@@ -552,7 +556,7 @@ contract PrefundedMiningPowerLedgerTest is PrefundedMiningStack {
     /// is then no longer eligible.
     function testMaturedUnassignHeldUntilNextSnapshot() public {
         _useGatedModule();
-        _qualify(ALICE, MINER, GATED_MIN);
+        _qualifyAndFund(ALICE, MINER, GATED_MIN, LOCK);
         uint256 c = cid;
         vm.warp(block.timestamp + COOLDOWN);
         _unassign(ALICE, MINER, GATED_MIN);
@@ -704,7 +708,8 @@ contract PrefundedMiningPowerLedgerTest is PrefundedMiningStack {
     /// release the hold. Next challenge W2 counts and W1 does not.
     function testHeldStakeCannotCountTwiceInOneChallenge() public {
         _useGatedModule();
-        _qualify(ALICE, MINER, GATED_MIN);
+        _fund(MINER2, LOCK);
+        _qualifyAndFund(ALICE, MINER, GATED_MIN, LOCK);
         uint256 c = cid;
         vm.warp(block.timestamp + COOLDOWN);
         _unassign(ALICE, MINER, GATED_MIN);
@@ -849,7 +854,21 @@ contract PrefundedMiningPowerLedgerTest is PrefundedMiningStack {
         }
         assertEq(module.totalStake(), 0);
         assertEq(module.totalAssigned(), 0);
-        assertEq(token.balanceOf(address(module)), 0);
+        // S6: every accepted proof committed LOCK of its winner's mint funds
+        // (released only in S7). The winners take back their unused funds;
+        // what remains in the module is exactly the commitments.
+        address[3] memory winners = [OUTSIDER, MINER, MINER2];
+        for (uint256 k = 0; k < 3; k++) {
+            uint256 left = module.fundsOf(winners[k]);
+            if (left != 0) {
+                vm.prank(winners[k]);
+                module.withdrawFunds(left);
+            }
+        }
+        assertEq(module.totalFunds(), 0);
+        assertEq(module.totalCommitted(), LOCK * nft.mintedEver());
+        assertEq(token.balanceOf(address(module)), module.totalCommitted());
+        _assertBooks();
         assertEq(module.assignedOf(MINER), 0);
         assertEq(module.assignedOf(MINER2), 0);
     }
@@ -871,10 +890,15 @@ contract PrefundedMiningPowerLedgerTest is PrefundedMiningStack {
         assertEq(s, stake, "frozen stake");
     }
 
-    /// @dev Swap the attached base module for a curve-enabled one.
+    /// @dev Swap the attached base module for a curve-enabled one. S6: the
+    /// wallets these tests mine with are funded BEFORE attach (enough for
+    /// every possible win), so their funds count from the attach challenge.
     function _useCurvedModule() private {
         _detach();
         _deployModule(0, LOCK, COOLDOWN, CURVE_UNIT, address(0));
+        _fund(OUTSIDER, 48 * LOCK);
+        _fund(MINER, 48 * LOCK);
+        _fund(MINER2, 48 * LOCK);
         _attach(module);
         assertEq(module.CURVE_UNIT(), CURVE_UNIT);
     }
