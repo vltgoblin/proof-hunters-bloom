@@ -52,10 +52,16 @@ interface IPrefundedMiningCoreView {
 /// - S0 default 7: the HUNTER token is a test fixture until the canonical
 ///   token is bound.
 ///
-/// Slice status (S3): hooks are pass-through — the multiplier is always
-/// 1.0x, nothing is gated and no lock is taken. Challenge bookkeeping
-/// (`wired`, `retired`, `latestChallengeId`, `lastAcceptedProofs`) mirrors
-/// `MiningPowerCustody` exactly so the module is a drop-in for the core.
+/// Slice status (S4): the stake ledger is live — `deposit`, `assign`,
+/// `unassign` and `withdraw` port `MiningPowerCustody`'s accounting (pending
+/// and removing buckets, per-depositor pending share, per-wallet lazy freeze)
+/// with a wall-clock `EXIT_COOLDOWN` in place of the old 12-proof unlock
+/// delay. `powerMultiplierWad` freezes the wallet's stake for the challenge
+/// and returns the curve at the frozen amount (always 1.0x when
+/// `CURVE_UNIT == 0`), but nothing is gated yet (S5) and no mint lock is
+/// taken (S6). Challenge bookkeeping (`wired`, `retired`,
+/// `latestChallengeId`, `lastAcceptedProofs`) mirrors `MiningPowerCustody`
+/// exactly so the module is a drop-in for the core.
 contract PrefundedMiningPower is IMiningPower, ReentrancyGuard {
     using SafeERC20 for IERC20;
 
@@ -142,7 +148,39 @@ contract PrefundedMiningPower is IMiningPower, ReentrancyGuard {
     /// @notice True once the failsafe guardian waived the requirement (one-way).
     bool public gateDisabled;
 
+    /// @notice Deposited stake not assigned to any mining wallet.
+    mapping(address => uint256) public unassignedOf;
+    /// @notice Total stake assigned to a mining wallet (freeze source).
+    mapping(address => uint256) public assignedOf;
+    /// @notice Stake this depositor currently has assigned to `assigneeOf[depositor]`.
+    mapping(address => uint256) public assignedBy;
+    /// @notice The single mining wallet a depositor's assigned stake backs.
+    mapping(address => address) public assigneeOf;
+    /// @notice `block.timestamp` of this depositor's latest assign (a top-up
+    /// resets it). The cooldown clock is per depositor so a shared mining
+    /// wallet's other backers can never reset or shorten it.
+    mapping(address => uint256) public assignTimestamp;
+    /// @notice Assigns made while `pendingEpoch[wallet]` was the open
+    /// challenge. They are part of `assignedOf` but excluded from that
+    /// challenge's freeze — a digest is derivable once its seed is readable,
+    /// so stake that arrives after a challenge opened counts from the next one.
+    mapping(address => uint256) public pendingOf;
+    /// @notice Challenge the wallet's `pendingOf` / `removingOf` buckets belong to.
+    mapping(address => uint256) public pendingEpoch;
+    /// @notice This depositor's own share of their wallet's pending bucket,
+    /// kept per depositor so one account's unassign cannot launder another's
+    /// post-open stake into matured power.
+    mapping(address => uint256) public pendingBy;
+    /// @notice Challenge the depositor's `pendingBy` share belongs to.
+    mapping(address => uint256) public pendingEpochBy;
+    /// @notice Matured stake unassigned while `pendingEpoch[wallet]` is the
+    /// open challenge. Added back at that challenge's freeze so removals only
+    /// take effect from the next one — the bind holds for exits as for entries.
+    mapping(address => uint256) public removingOf;
+
     mapping(uint256 => bool) private _challengeOpen;
+    mapping(uint256 => mapping(address => bool)) private _frozen;
+    mapping(uint256 => mapping(address => uint256)) private _frozenStake;
 
     modifier onlyMiningCore() {
         if (msg.sender != miningCore) revert UnauthorizedCaller(msg.sender);
@@ -175,16 +213,17 @@ contract PrefundedMiningPower is IMiningPower, ReentrancyGuard {
     // ------------------------------------------------------------------
 
     /// @inheritdoc IMiningPower
-    /// @dev S3 pass-through: no stake is frozen yet, so the multiplier is the
-    /// curve at zero stake, which is always the 1.0x base.
-    function powerMultiplierWad(uint256, address) external view onlyMiningCore returns (uint256) {
-        return multiplierFromLockedAmount(0);
+    /// @dev Freezes `miner`'s stake for `challengeId` on first read and
+    /// returns the curve at the frozen amount (1.0x when `CURVE_UNIT == 0`).
+    /// S4: no eligibility gate yet — that lands in S5.
+    function powerMultiplierWad(uint256 challengeId, address miner) external onlyMiningCore returns (uint256) {
+        return multiplierFromLockedAmount(_freeze(challengeId, miner));
     }
 
     /// @inheritdoc IMiningPower
-    /// @dev S3 pass-through: no stake ledger yet.
-    function snapshottedLockedAmount(uint256, address) external view onlyMiningCore returns (uint256) {
-        return 0;
+    /// @dev Same lazy freeze as `powerMultiplierWad`; returns the frozen stake.
+    function snapshottedLockedAmount(uint256 challengeId, address miner) external onlyMiningCore returns (uint256) {
+        return _freeze(challengeId, miner);
     }
 
     /// @inheritdoc IMiningPower
@@ -221,6 +260,109 @@ contract PrefundedMiningPower is IMiningPower, ReentrancyGuard {
     }
 
     // ------------------------------------------------------------------
+    // Stake ledger (S4) — port of MiningPowerCustody
+    // ------------------------------------------------------------------
+
+    /// @notice Deposit HUNTER as unassigned stake. Allowed in every state —
+    /// an unassigned deposit carries no power and can always be withdrawn.
+    /// @dev Credits the measured balance delta. A zero receipt, a receipt
+    /// larger than `amount` (S0 default 5) or a balance that shrinks reverts
+    /// `UnsupportedTokenReceipt`. Solvency is checked before and after.
+    function deposit(uint256 amount) external nonReentrant {
+        if (amount == 0) revert ZeroAmount();
+        uint256 beforeBal = _requireSolvent();
+        HUNTER.safeTransferFrom(msg.sender, address(this), amount);
+        uint256 afterBal = HUNTER.balanceOf(address(this));
+        if (afterBal <= beforeBal || afterBal - beforeBal > amount) revert UnsupportedTokenReceipt();
+        uint256 received = afterBal - beforeBal;
+        unassignedOf[msg.sender] += received;
+        totalStake += received;
+        _requireSolvent();
+        emit Deposited(msg.sender, received);
+    }
+
+    /// @notice Assign unassigned stake to one mining wallet. The stake is
+    /// pending for the open challenge and counts from the next snapshot.
+    /// Every assign (including a top-up) restarts the caller's cooldown.
+    /// @dev Refused unless this module is the wired, non-retired module and
+    /// the failsafe has not fired — no stake is parked on a module that can
+    /// never mint. A depositor backs one wallet at a time and can never be
+    /// its own mining wallet (S0 default 6).
+    function assign(address miningWallet, uint256 amount) external nonReentrant {
+        // `retired` is checked first: a terminal detach also clears `wired`,
+        // so checking `wired` first would make `Retired` unreachable.
+        if (retired) revert Retired();
+        if (!wired) revert NotWired();
+        if (gateDisabled) revert GateDisabled();
+        if (miningWallet == address(0)) revert ZeroAddress();
+        if (miningWallet == msg.sender) revert SelfAssignment();
+        if (amount == 0) revert ZeroAmount();
+        address current = assigneeOf[msg.sender];
+        if (current != address(0) && current != miningWallet) revert MustUnassignFirst(current);
+        uint256 available = unassignedOf[msg.sender];
+        if (amount > available) revert InsufficientUnassigned(available, amount);
+        _retagBuckets(miningWallet);
+        unassignedOf[msg.sender] = available - amount;
+        assignedOf[miningWallet] += amount;
+        assignedBy[msg.sender] += amount;
+        totalAssigned += amount;
+        pendingOf[miningWallet] += amount;
+        pendingBy[msg.sender] += amount;
+        assigneeOf[msg.sender] = miningWallet;
+        assignTimestamp[msg.sender] = block.timestamp;
+        emit Assigned(msg.sender, miningWallet, amount, block.timestamp);
+    }
+
+    /// @notice Return assigned stake to the caller's unassigned balance.
+    /// @dev Requires `EXIT_COOLDOWN` seconds since the caller's latest assign,
+    /// waived once the module is retired (terminal detach) or the failsafe
+    /// fired. The cooldown is wall-clock only and never reads proof counts,
+    /// so a detached module's stake always becomes exitable. The caller's own
+    /// still-pending share leaves first; the matured remainder is queued in
+    /// `removingOf` so it only narrows the NEXT challenge's freeze.
+    /// Fails closed (`Insolvency`) when the books no longer cover the balance.
+    function unassign(address miningWallet, uint256 amount) external nonReentrant {
+        if (miningWallet == address(0)) revert ZeroAddress();
+        if (amount == 0) revert ZeroAmount();
+        if (assigneeOf[msg.sender] != miningWallet) revert WrongAssignee(assigneeOf[msg.sender], miningWallet);
+        if (!retired && !gateDisabled) {
+            uint256 earliest = assignTimestamp[msg.sender] + EXIT_COOLDOWN;
+            if (block.timestamp < earliest) revert CooldownNotMet(earliest, block.timestamp);
+        }
+        uint256 available = assignedBy[msg.sender];
+        if (amount > available) revert InsufficientAssigned(available, amount);
+        _requireSolvent();
+        _retagBuckets(miningWallet);
+        uint256 pendingPart = pendingBy[msg.sender] < amount ? pendingBy[msg.sender] : amount;
+        pendingBy[msg.sender] -= pendingPart;
+        pendingOf[miningWallet] -= pendingPart;
+        removingOf[miningWallet] += amount - pendingPart;
+        assignedBy[msg.sender] = available - amount;
+        assignedOf[miningWallet] -= amount;
+        totalAssigned -= amount;
+        unassignedOf[msg.sender] += amount;
+        if (assignedBy[msg.sender] == 0) assigneeOf[msg.sender] = address(0);
+        emit Unassigned(msg.sender, miningWallet, amount, block.timestamp);
+    }
+
+    /// @notice Withdraw unassigned stake. Allowed in every state.
+    /// @dev The module's balance must drop by exactly `amount`
+    /// (`DebitMismatch` otherwise) and stay solvent before and after.
+    function withdraw(uint256 amount) external nonReentrant {
+        if (amount == 0) revert ZeroAmount();
+        uint256 available = unassignedOf[msg.sender];
+        if (amount > available) revert InsufficientUnassigned(available, amount);
+        uint256 beforeBal = _requireSolvent();
+        unassignedOf[msg.sender] = available - amount;
+        totalStake -= amount;
+        HUNTER.safeTransfer(msg.sender, amount);
+        uint256 afterBal = HUNTER.balanceOf(address(this));
+        if (afterBal > beforeBal || beforeBal - afterBal != amount) revert DebitMismatch();
+        _requireSolvent();
+        emit Withdrawn(msg.sender, amount);
+    }
+
+    // ------------------------------------------------------------------
     // Views
     // ------------------------------------------------------------------
 
@@ -234,5 +376,53 @@ contract PrefundedMiningPower is IMiningPower, ReentrancyGuard {
         uint256 bonus = Math.mulDiv(_SLOPE_WAD, logTerm, _WAD);
         if (bonus > _CAP_BONUS_WAD) bonus = _CAP_BONUS_WAD;
         return _WAD + bonus;
+    }
+
+    // ------------------------------------------------------------------
+    // Internal
+    // ------------------------------------------------------------------
+
+    /// @dev Pending from an older epoch has matured and queued removals have
+    /// landed; retag the wallet's buckets and the caller's pending share to
+    /// the latest challenge before recording an assign or unassign against it.
+    function _retagBuckets(address miningWallet) private {
+        uint256 latest = latestChallengeId;
+        if (pendingEpoch[miningWallet] < latest) {
+            pendingOf[miningWallet] = 0;
+            removingOf[miningWallet] = 0;
+            pendingEpoch[miningWallet] = latest;
+        }
+        if (pendingEpochBy[msg.sender] < latest) {
+            pendingBy[msg.sender] = 0;
+            pendingEpochBy[msg.sender] = latest;
+        }
+    }
+
+    /// @dev Lazy per-wallet freeze, identical to `MiningPowerCustody._freeze`.
+    /// The first read for (challengeId, wallet) records the stake that was
+    /// matured when the challenge opened: assigns made after opening are
+    /// pending (excluded) and matured removals made after opening are added
+    /// back. Later reads return the recorded value unchanged.
+    function _freeze(uint256 challengeId, address miningWallet) private returns (uint256 frozen) {
+        if (!_challengeOpen[challengeId]) revert ChallengeNotOpen(challengeId);
+        if (_frozen[challengeId][miningWallet]) return _frozenStake[challengeId][miningWallet];
+        // A never-frozen challenge can only be reconstructed for the latest
+        // epoch — older balances are no longer derivable once buckets settle,
+        // so refuse rather than permanently record a wrong snapshot.
+        if (challengeId != latestChallengeId) revert StaleChallengeId(challengeId, latestChallengeId);
+        frozen = assignedOf[miningWallet];
+        if (pendingEpoch[miningWallet] == challengeId) {
+            frozen = frozen - pendingOf[miningWallet] + removingOf[miningWallet];
+        }
+        _frozenStake[challengeId][miningWallet] = frozen;
+        _frozen[challengeId][miningWallet] = true;
+    }
+
+    /// @dev Fails closed when the recorded obligations exceed the balance —
+    /// corrupted totals block exits instead of paying out. Returns the
+    /// balance read so callers can reuse it as their measurement baseline.
+    function _requireSolvent() private view returns (uint256 balance) {
+        balance = HUNTER.balanceOf(address(this));
+        if (balance < totalStake + totalFunds + totalCommitted) revert Insolvency();
     }
 }

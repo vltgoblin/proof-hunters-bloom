@@ -12,6 +12,7 @@ import {HunterBackingVault} from "../../src/bloom/HunterBackingVault.sol";
 import {WeightedRoundLedger} from "../../src/bloom/WeightedRoundLedger.sol";
 import {HunterMiningCore} from "../../src/bloom/HunterMiningCore.sol";
 import {MiningPowerCustody} from "../../src/bloom/MiningPowerCustody.sol";
+import {PrefundedMiningPower} from "../../src/bloom/PrefundedMiningPower.sol";
 import {IMiningPower} from "../../src/bloom/IMiningPower.sol";
 import {DirectLoan} from "../../src/bloom/DirectLoan.sol";
 import {LiveHunt} from "../../src/LiveHunt.sol";
@@ -37,10 +38,12 @@ contract PrefundedStackLoanAsset is ERC20 {
 /// launch authority (token-bound like production), a real LiveHunt and a real
 /// DirectLoan bound to the core-deployed NFT, and the OLD MiningPowerCustody
 /// (`oldCustody`) constructed against `token` and `core` but NOT attached.
-/// @dev Deliberately free of any PrefundedMiningPower import so it compiles
-/// before the module exists; a module-aware stack can extend this contract.
-/// No module is attached by default — mining runs module-free until a test
-/// calls `_attach`. Every amount, fee and bound is a TEST-ONLY fixture value
+/// @dev `_deployModule` builds a PrefundedMiningPower against `token` and
+/// `core` and records it as `module`; ledger helpers (`_deposit`, `_assign`,
+/// `_unassign`, `_withdraw`) track every depositor and mining wallet they
+/// touch so `_assertBooks` can prove the per-account sums. No module is
+/// attached by default — mining runs module-free until a test calls
+/// `_attach`. Every amount, fee and bound is a TEST-ONLY fixture value
 /// taken from existing suites, never a launch decision.
 abstract contract PrefundedMiningStack is Test {
     BasketRegistry internal registry;
@@ -55,7 +58,15 @@ abstract contract PrefundedMiningStack is Test {
     DirectLoan internal loan;
     PrefundedStackLoanAsset internal loanAsset;
     MiningPowerCustody internal oldCustody;
+    /// @dev Module under test, set by `_deployModule` (zero until then).
+    PrefundedMiningPower internal module;
     address internal basket;
+
+    /// @dev Every depositor / mining wallet the ledger helpers touched.
+    address[] internal trackedDepositors;
+    address[] internal trackedWallets;
+    mapping(address => bool) private _isTrackedDepositor;
+    mapping(address => bool) private _isTrackedWallet;
 
     address internal constant ALICE = address(0xA11CE);
     address internal constant BOB = address(0xB0B);
@@ -220,10 +231,10 @@ abstract contract PrefundedMiningStack is Test {
     }
 
     /// @dev Stop multisig wires `module` through the pre-sunset setter.
-    function _attach(IMiningPower module) internal {
+    function _attach(IMiningPower power) internal {
         vm.prank(STOP);
-        core.setMiningPower(module);
-        assertEq(address(core.miningPower()), address(module));
+        core.setMiningPower(power);
+        assertEq(address(core.miningPower()), address(power));
     }
 
     /// @dev Stop multisig detaches the current module (non-terminal).
@@ -233,11 +244,100 @@ abstract contract PrefundedMiningStack is Test {
         assertEq(address(core.miningPower()), address(0));
     }
 
-    /// @dev Harness token books. With no Prefunded module this checks the old
-    /// custody: it holds exactly its recorded stake and never assigns more than
-    /// it holds. Module-aware stacks override and call `super._assertBooks()`.
+    /// @dev Deploys the module under test against `token` and `core` and
+    /// records it as `module`. Not attached — call `_attach(module)`.
+    function _deployModule(uint256 minStake, uint256 lock, uint256 cooldown, uint256 curveUnit, address guardian)
+        internal
+        returns (PrefundedMiningPower)
+    {
+        module = new PrefundedMiningPower(address(token), address(core), minStake, lock, cooldown, curveUnit, guardian);
+        return module;
+    }
+
+    function _trackDepositor(address who) internal {
+        if (_isTrackedDepositor[who]) return;
+        _isTrackedDepositor[who] = true;
+        trackedDepositors.push(who);
+    }
+
+    function _trackWallet(address wallet) internal {
+        if (_isTrackedWallet[wallet]) return;
+        _isTrackedWallet[wallet] = true;
+        trackedWallets.push(wallet);
+    }
+
+    /// @dev Mints `amt` fixture HUNTER to `who` and deposits it into `module`.
+    function _deposit(address who, uint256 amt) internal {
+        _trackDepositor(who);
+        token.mint(who, amt);
+        vm.startPrank(who);
+        token.approve(address(module), amt);
+        module.deposit(amt);
+        vm.stopPrank();
+    }
+
+    function _assign(address who, address wallet, uint256 amt) internal {
+        _trackDepositor(who);
+        _trackWallet(wallet);
+        vm.prank(who);
+        module.assign(wallet, amt);
+    }
+
+    function _unassign(address who, address wallet, uint256 amt) internal {
+        _trackDepositor(who);
+        _trackWallet(wallet);
+        vm.prank(who);
+        module.unassign(wallet, amt);
+    }
+
+    function _withdraw(address who, uint256 amt) internal {
+        _trackDepositor(who);
+        vm.prank(who);
+        module.withdraw(amt);
+    }
+
+    /// @dev Harness token books. The old custody holds exactly its recorded
+    /// stake and never assigns more than it holds. When a Prefunded `module`
+    /// is deployed it must hold at least its obligations, and the tracked
+    /// accounts must reproduce its totals exactly (every depositor's
+    /// unassigned + assigned stake sums to `totalStake`; every wallet's
+    /// assigned stake sums to `totalAssigned` and equals the sum of its
+    /// backers' `assignedBy`). Only exact while all ledger calls go through
+    /// the tracking helpers (or `_trackDepositor` / `_trackWallet`).
     function _assertBooks() internal view virtual {
         assertEq(token.balanceOf(address(oldCustody)), oldCustody.totalLocked(), "old custody books");
         assertLe(oldCustody.totalAssigned(), oldCustody.totalLocked(), "old custody over-assigned");
+        if (address(module) == address(0)) return;
+
+        assertGe(
+            token.balanceOf(address(module)),
+            module.totalStake() + module.totalFunds() + module.totalCommitted(),
+            "module insolvent"
+        );
+        assertLe(module.totalAssigned(), module.totalStake(), "module over-assigned");
+
+        uint256 stakeSum;
+        for (uint256 i = 0; i < trackedDepositors.length; i++) {
+            address d = trackedDepositors[i];
+            stakeSum += module.unassignedOf(d) + module.assignedBy(d);
+            assertLe(module.pendingBy(d), module.assignedBy(d), "pendingBy > assignedBy");
+            if (module.assignedBy(d) == 0) assertEq(module.assigneeOf(d), address(0), "dangling assignee");
+            else assertTrue(module.assigneeOf(d) != address(0), "assigned without assignee");
+        }
+        assertEq(stakeSum, module.totalStake(), "depositor sums != totalStake");
+
+        uint256 assignedSum;
+        for (uint256 j = 0; j < trackedWallets.length; j++) {
+            address w = trackedWallets[j];
+            assignedSum += module.assignedOf(w);
+            assertLe(module.pendingOf(w), module.assignedOf(w), "pendingOf > assignedOf");
+            uint256 backers;
+            for (uint256 i = 0; i < trackedDepositors.length; i++) {
+                address d = trackedDepositors[i];
+                if (module.assigneeOf(d) == w) backers += module.assignedBy(d);
+            }
+            assertEq(backers, module.assignedOf(w), "wallet != sum of backers");
+        }
+        assertEq(assignedSum, module.totalAssigned(), "wallet sums != totalAssigned");
     }
 }
