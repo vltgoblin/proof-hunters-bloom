@@ -1,0 +1,64 @@
+name: Bloom source checks
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  publication:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: '22'
+      - name: Test and run publication guard
+        run: |
+          node --test scripts/check-publication.test.mjs
+          node scripts/check-publication.mjs
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
+        with:
+          go-version: '1.24.11'
+          cache: false
+      - name: Install pinned Gitleaks
+        run: go install github.com/zricethezav/gitleaks/v8@v8.30.1
+      - name: Scan public source and its history
+        shell: bash
+        run: |
+          snapshot_dir=$(mktemp -d)
+          git archive HEAD | tar -x -C "$snapshot_dir"
+          gitleaks dir "$snapshot_dir" --redact --ignore-gitleaks-allow --no-banner
+          gitleaks git . --redact --ignore-gitleaks-allow --log-opts="--all" --no-banner
+
+  contracts:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        profile: [default, release]
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          submodules: recursive
+          persist-credentials: false
+      - uses: foundry-rs/foundry-toolchain@908c540300062bd5a7e473851cdb4282204cee09 # v1
+        with:
+          version: v1.7.1
+      - name: Build and test contracts
+        env:
+          FOUNDRY_PROFILE: ${{ matrix.profile }}
+        run: |
+          forge build --root contracts
+          forge test --root contracts --summary
+      - name: Arithmetic vector and fuzz tests
+        if: matrix.profile == 'default'
+        run: forge test --root contracts/specs/hunter-bloom --summary

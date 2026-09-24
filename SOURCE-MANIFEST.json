@@ -1,0 +1,394 @@
+{
+  "sourceRevision": "256d82309c478624ac014763f416305dfa3789f1",
+  "description": "Allowlisted source and tests with first-party Apache-2.0 licensing headers. sourceSha256 records the original snapshot; sha256 records this package. Not a deployment attestation.",
+  "license": "Apache-2.0",
+  "sourceLicense": "MIT",
+  "transformation": "first-party-license-header-v1",
+  "files": [
+    {
+      "path": "contracts/specs/hunter-bloom/src/WeightedRatioMath.sol",
+      "sourceSha256": "09842746c686196f25e48fc269556dc2e6b08211965df982d44c333e648a7cbb",
+      "sha256": "f11943700c6465dec0acfa469e5d574dbcf8593abdfe5b5634ca5a84a622d2f7"
+    },
+    {
+      "path": "contracts/specs/hunter-bloom/src/WeightedRewardMath.sol",
+      "sourceSha256": "700a9e5e24de73ff3ccbbbb6553a5c251e6e504806497ce08491abc79be3c7af",
+      "sha256": "0d8f60f13a227ed72799964c058f0bec8861777e3eb94b726a7a34fe0965af71"
+    },
+    {
+      "path": "contracts/specs/hunter-bloom/test/WeightedRatioMath.t.sol",
+      "sourceSha256": "34cc87b5304097d26f244597f65101bc2017b3ce84fb283d60d4076663004158",
+      "sha256": "0be9a76a6bd33999a9348d82addea71c16b1ce4c3f08a25e6a732b83a4212851"
+    },
+    {
+      "path": "contracts/specs/hunter-bloom/test/WeightedRewardMath.t.sol",
+      "sourceSha256": "0d5e797a74ee1f69fb2664f72361ee7452f73978ef9d904f44d86c2294d4dea8",
+      "sha256": "1395f9cccab493b3f280f456c1be38f1f49f5bf4b3a034b74e740e63300804b1"
+    },
+    {
+      "path": "contracts/specs/hunter-bloom/test/fixtures/weighted-ratio-vectors.json",
+      "sourceSha256": "2817c2acb1fdb74f9f37d352890bd8c4bacd58957deba8f1bd0e602a0ec4ea1e",
+      "sha256": "2817c2acb1fdb74f9f37d352890bd8c4bacd58957deba8f1bd0e602a0ec4ea1e"
+    },
+    {
+      "path": "contracts/specs/hunter-bloom/test/fixtures/weighted-reward-vectors.json",
+      "sourceSha256": "2a9e7e3fde9cd3ba97a95a9ae4b25bed63bf2ea10c00d382b26836403f18e131",
+      "sha256": "2a9e7e3fde9cd3ba97a95a9ae4b25bed63bf2ea10c00d382b26836403f18e131"
+    },
+    {
+      "path": "contracts/src/ILiveHuntNFT.sol",
+      "sourceSha256": "e4f162553e19dd04f8acb47e7eed9e93ded7a9b470d1f28374b4ab1d432029a6",
+      "sha256": "a7a3825262bd1164f7dd854c2f4b0330f25b103a3072ef75499c9669f40e1cc4"
+    },
+    {
+      "path": "contracts/src/LiveHunt.sol",
+      "sourceSha256": "2f997d6c80188a406704eda20a80589199f379b3c5908ad9a18d90c32f2c90c1",
+      "sha256": "05540a5a124ac2d06c1cdae1458cd3155e426b762b76b158ce3f8b8a61c32610"
+    },
+    {
+      "path": "contracts/src/bloom/BasketRegistry.sol",
+      "sourceSha256": "082eac1050d7d6b6cfc270aa28bdaf85094b0e1a1342d64755e7d71737810972",
+      "sha256": "66b22ad5f3743ab87552b69e858b4c4a1929adea7e5896e3c5926c7a05919cde"
+    },
+    {
+      "path": "contracts/src/bloom/DirectLoan.sol",
+      "sourceSha256": "a45c9b6d307acffcec5050deadf6517cc8896c65ef49d7c4f518c74059248ad1",
+      "sha256": "e3efce4cf3aeb34c4a9cc820c4a0d8dde01dac2c9c80f179a3d5f48028c81649"
+    },
+    {
+      "path": "contracts/src/bloom/HunterBackingVault.sol",
+      "sourceSha256": "d14669f127e20fdd6991e6dcdf8ff02d9d6a2de2acf77ac4e05498838dafbfa2",
+      "sha256": "032059506f9c495c8062e7d53d88b58f8fc10e967e04c8d0fe6bf1e6cd6b784c"
+    },
+    {
+      "path": "contracts/src/bloom/HunterLifecycle.sol",
+      "sourceSha256": "a479a6ba0f240c0336eb0a014092eeead301b585f395d93023a3f45cea51c5d7",
+      "sha256": "50149be1f0f9fd14b98d672e3695243fb3c73347beb95f56adae51ddce0f8bbe"
+    },
+    {
+      "path": "contracts/src/bloom/HunterMiningCore.sol",
+      "sourceSha256": "3a3e6b4927db9091dbadf7123b7a935ff2a10bbdce6bf502c8f2dada06d97eb1",
+      "sha256": "d15f99fc7c1f1a37a542e159473ec15ed68e4fc4d2d71cc49d48263b6260e75b"
+    },
+    {
+      "path": "contracts/src/bloom/HunterNFT.sol",
+      "sourceSha256": "fcae88cc4b0437f7f6bdb2ad6314e874c8e1b3f9ca683316709390f1526bb0c4",
+      "sha256": "8ab15db50ef5fe098cc476bf61bc15cf53e5b01a92cac877a829a7432546a2b0"
+    },
+    {
+      "path": "contracts/src/bloom/HunterReserveVault.sol",
+      "sourceSha256": "a0f2aa996ba747ec56bb0384ca0e9ff11d981ad122e7ca4a95aac476a3188338",
+      "sha256": "975d3372d4d41197c852cf49d9ab1e9a6069b90bcbeeaefabccdad21079650b8"
+    },
+    {
+      "path": "contracts/src/bloom/IBasketConverter.sol",
+      "sourceSha256": "dbea2372f9e8feed8e8fc2e61e3596efb9dabda404c64df7432678f5e57aa6fc",
+      "sha256": "ff2c3780531f96c86030e2129ee34110ed8666c9bdaa4adbc8a193f1ca98226b"
+    },
+    {
+      "path": "contracts/src/bloom/IMiningPower.sol",
+      "sourceSha256": "b1d2f04d496b907d80a7defd3e2dabeaa43bb28f08957e96ac16d286cbe028fa",
+      "sha256": "ba2963b54ce25c7a3c571f72fe75e88d531f9d5f074c02a315a55d7f8e486399"
+    },
+    {
+      "path": "contracts/src/bloom/MiningPowerCustody.sol",
+      "sourceSha256": "6a8fc9347e8dce5f71af385b7edca2f5e42b4e29bf0de027a8478fd12e57e4ef",
+      "sha256": "f5b4f2f9a8324433faace050fb6c525cbe2832a4564c17134b6ec44e4af4be6e"
+    },
+    {
+      "path": "contracts/src/bloom/WeightedRoundFunding.sol",
+      "sourceSha256": "68958257c053fb1777134641c291065b4a801cc94e13251816908e946e01ee3f",
+      "sha256": "f17dea804af4686516c35e3e458da9f82511b686ef97362846e1f5c69b2bc8fd"
+    },
+    {
+      "path": "contracts/src/bloom/WeightedRoundLedger.sol",
+      "sourceSha256": "266f144f321f40a2736b6257defb0b0d372ef5095e3a7f5c1fba9b6c97712f7d",
+      "sha256": "ebe99b5d0d9c688a0f92229d5a15557ad893ee61e99687e937cb2448f277a27b"
+    },
+    {
+      "path": "contracts/src/bloom/WeightedRoundMaterialisation.sol",
+      "sourceSha256": "73f0bfb30a1a0b8dda4b16c724331833035ad1b0013b33708b2924d978dff846",
+      "sha256": "85fb4c15f22f03f34354a0d9e14f8dbf6e751b6ce8a842744f2e2bab5d45c138"
+    },
+    {
+      "path": "contracts/src/bloom/libraries/WeightedHistory.sol",
+      "sourceSha256": "3cd3ccb34bf2f93175f3daf8bc730e46633ee9c92f8ce3c931be06c68d9e1b87",
+      "sha256": "633f40c66a48a69a577ef223163a5d956d5d382c0a544175c9d7a70b7b4e644d"
+    },
+    {
+      "path": "contracts/test/BasketRegistry.t.sol",
+      "sourceSha256": "1c96207e7ccaf7fc1af72632e85c205ecac68ca2a55226e811d2d0f5ae2969af",
+      "sha256": "1cdd2fa54419598f58080ca6a33687b8a3cecb3b4dea65adc40442d8c19e1295"
+    },
+    {
+      "path": "contracts/test/BasketRegistryEdges.t.sol",
+      "sourceSha256": "9e0fa62d421077680ceaf46322801edd758a7b61953c49f0199322e5a7ebecd6",
+      "sha256": "5dcf86a9d6fba0ffae20bbab8cf89e41499ae02fb2bf655108cf51485381adb5"
+    },
+    {
+      "path": "contracts/test/DirectLoan.t.sol",
+      "sourceSha256": "1abe58f41b50668af13646e31548c7a029ace663483c6cfb0f925a2e7423d30c",
+      "sha256": "b25166191428a4cb611e25a6b4807b0d00262518736922589a4f8062ac8a407b"
+    },
+    {
+      "path": "contracts/test/DirectLoanBackingInEscrow.t.sol",
+      "sourceSha256": "a41de897e8402df43140554d477bbedf4b85a9225c29dea063b6458327f9e092",
+      "sha256": "e3b54e0a455f5dcd31f7b24b187499bce7d2f5941c509be2774bf783492a6ab9"
+    },
+    {
+      "path": "contracts/test/DirectLoanMoneyInvariant.t.sol",
+      "sourceSha256": "754fe07591184d93c53a501b5222c0424d7de1b6e784c6ab046c07d9997e774e",
+      "sha256": "75e26f9655ef5c7e3f36b134bdc64f472a561ae8fdf0729ea473e337e91438c0"
+    },
+    {
+      "path": "contracts/test/DirectLoanMutualExclusion.t.sol",
+      "sourceSha256": "27944deda4cdd6ae433a46581f7c9a37d0ef0ba4d5def257aa1c83269bc49c88",
+      "sha256": "97e79d7a8701b3af6071f5d61fa204e784b5110f1d8aacaf60d83b788f320c1c"
+    },
+    {
+      "path": "contracts/test/HunterAccountingInvariant.t.sol",
+      "sourceSha256": "d2875231392bbd51f5153f78c683ecb52ade255c73336d13c55a99ce5a1060b3",
+      "sha256": "396c97e3bc1cd2e13e6b8204c01ae26ad3076f07c61193800a1c396ae4be5819"
+    },
+    {
+      "path": "contracts/test/HunterBackingPayout.t.sol",
+      "sourceSha256": "4555b375acf3c2b039ca93d4c0f83c814a5f22bb3424a4e171a5b07bb16b8d39",
+      "sha256": "67df375a24054097e1901e325b0cd9f7a81ff2d84235267720ce9e63c9c99a49"
+    },
+    {
+      "path": "contracts/test/HunterBackingVaultEdges.t.sol",
+      "sourceSha256": "db737df149d3569d6a2cdfeaa3ef7d9dd553522250967c1c9bd8bab8ede5e5ea",
+      "sha256": "6293845fb4d333f713e21dbb4bfa842430fad246bd79b7cc4d5bdf779c51ed8a"
+    },
+    {
+      "path": "contracts/test/HunterBasketSwitch.t.sol",
+      "sourceSha256": "d68f0d42b67231ae06741b13db0417a4042138881d4268e5622dc45ac9db8d66",
+      "sha256": "881ca296e80ce80db8d861c81ff4e1c4c5be747eeb6d6114483182e33437700f"
+    },
+    {
+      "path": "contracts/test/HunterLateMiningPower.t.sol",
+      "sourceSha256": "7c75a99fdeb3be571e92334bd0e960622f90be1c8fb84d58440c975a9781e01a",
+      "sha256": "0d0dd4d5eb2fdc7ed9befe2d4450e196ff322e1f874c6050b4ff14d239ddb83c"
+    },
+    {
+      "path": "contracts/test/HunterLateTokenActivation.t.sol",
+      "sourceSha256": "14924ce3a8889ce9637c71cada4226208db2a7cbd498ab8223cb517413546b40",
+      "sha256": "1ce3327e7c46dfc59ed1b4fec1ef4b4e3a53c4af1444aeefe36e11cda1c0d55b"
+    },
+    {
+      "path": "contracts/test/HunterLifecycleAuthority.t.sol",
+      "sourceSha256": "5c0449336b037cbc5f7c8001fa8a86e9b136792e995f378d570a02d88081d3aa",
+      "sha256": "f9e3097aa4a76e698a2d890c9266e9ec8e69fa270d71fe187e037a198d635922"
+    },
+    {
+      "path": "contracts/test/HunterLifecycleCallback.t.sol",
+      "sourceSha256": "4c598aceb1903d9182adf8170d8778a9b56ab37e958684b3d1ade1d639f5d595",
+      "sha256": "802d9c94d83bf9eb4cf858a9ad1af774a0334931e073657a648f84d87445c150"
+    },
+    {
+      "path": "contracts/test/HunterLifecycleCore.t.sol",
+      "sourceSha256": "1f173c99ebc678a6f4a016fa8f0182f63575655fb08668ac24fe8e72aad744bb",
+      "sha256": "504282e65f97b63bbcffd8073bf7592bfde9d9f6098210367aa1178b9770d901"
+    },
+    {
+      "path": "contracts/test/HunterLifecycleCoverage.t.sol",
+      "sourceSha256": "a7410eb9e52791a26141a9ae862de17bfe3b9b6ae6ae14462f3cf100258ae690",
+      "sha256": "eed9edde09e18f1a19e04ab79c2d1c0bdd32adc46bbc051bbde2c9fe9d3d2d64"
+    },
+    {
+      "path": "contracts/test/HunterLifecycleEdges.t.sol",
+      "sourceSha256": "79d031e3ca1c0aa4ee550be32d6d64d0e2bbdc413c143f7d2c206dd127a124ef",
+      "sha256": "6c35e4f3a55f2ee057aac3647ec97bc8404acb7f2da46a07406d625e029ca8a4"
+    },
+    {
+      "path": "contracts/test/HunterLifecycleWiring.t.sol",
+      "sourceSha256": "21ec2391d0f719a26141d6542da58e59df31403d590c769bcd65ec808203c366",
+      "sha256": "560ea8ea4473eda8e6dfee62bb19c7e769f4d581764169d8350f88d38efb82f1"
+    },
+    {
+      "path": "contracts/test/HunterLiveHuntIntegration.t.sol",
+      "sourceSha256": "729a434fb5c39d428d2455b031b37454452577792910b6774abcb233a161eb86",
+      "sha256": "663ac75731518c907754be17777ad48127cf58b07271f1409413a5758b296fd9"
+    },
+    {
+      "path": "contracts/test/HunterMiningCore.t.sol",
+      "sourceSha256": "f533d82c5291723e2cd7785f75e42cfe0b5c6ff16686c4ee31c8949f22a1ce0b",
+      "sha256": "6719ff3fd44d19c576b495ab9bfec2fce2d9d21d514adbc2beb702b3beb63ec7"
+    },
+    {
+      "path": "contracts/test/HunterMiningPowerAdversarial.t.sol",
+      "sourceSha256": "6305c2570347ac46cf9e637df66ca311059533f2af68aae230ace17b5caedd53",
+      "sha256": "3d09a06483e0530f0b205075e1cfdc764fb90128420d7738aa1dda210041f5b4"
+    },
+    {
+      "path": "contracts/test/HunterNFT.t.sol",
+      "sourceSha256": "800e7eab3be6d6517813ad34e10e804ae8f9d40f1f04e1b0595dedb5595fcfe6",
+      "sha256": "8cff5ec0ad9ea2b7136ece563e16ce598db66354226a0d3dea3f40d3b777d55b"
+    },
+    {
+      "path": "contracts/test/HunterNFTEdges.t.sol",
+      "sourceSha256": "19ba542b6b1aa7477a386b5cb2e42eaf81b0e5af3265477fe0b9042163508ddf",
+      "sha256": "9c09816fce8e7a5090a4d26a95afdf49e450163b0a638e51517b802538c10531"
+    },
+    {
+      "path": "contracts/test/HunterNewBasketAdmission.t.sol",
+      "sourceSha256": "49e0d96c24b194e4501dc93e6d3744f62484fac03b07fa2936ab72d2a51071ac",
+      "sha256": "ae5e10b7a2d180b3617d8902b66aea808060a0b58e3bd90c51f1198d3eabd566"
+    },
+    {
+      "path": "contracts/test/HunterOwnerBackingDeposit.t.sol",
+      "sourceSha256": "e0848848d6f99570ea2c6caedb37b1a6552eb9da796e7c6ec3cfa1c95e32f767",
+      "sha256": "0294875f8f8dd1157664b76ca4f5acd2eb879e20b2aeb833ab10f8cfe5a68a15"
+    },
+    {
+      "path": "contracts/test/HunterReserveBoundaries.t.sol",
+      "sourceSha256": "a356765b4d58407d7f373dde8a7816f7b0246ee7160cfeffc7a4391e0120c2c6",
+      "sha256": "b5a39183b05ffc54e205fe3b0ccaf670fcf59b557dcad1a506592019286506e3"
+    },
+    {
+      "path": "contracts/test/HunterReserveCore.t.sol",
+      "sourceSha256": "83c30867b1dd743f30d04f8c6bfd7e37d8397a3b797d978534176bd8b5939108",
+      "sha256": "2bc0b4beff5086bd6e96246aab7424690c5e4b03da0ac735c3bfaa3fdaacce81"
+    },
+    {
+      "path": "contracts/test/HunterReserveEdges.t.sol",
+      "sourceSha256": "5978124a23cbb19c808fcdae4fa49ed7ba1fea918e0ef37447f8f608b503185a",
+      "sha256": "5970b6f3ef364e15d81c96bc30078e38c095e98d1c7769f4a9dba8d090303e94"
+    },
+    {
+      "path": "contracts/test/HunterReserveHostileTokens.t.sol",
+      "sourceSha256": "e8d3f7ef49c89485f1b6a100e61a57b7102414d9c9d941ba6d18968389940e87",
+      "sha256": "cf7203b22c3e57d438057bb283ed1657f360cc5ef2e31435832d0a94307ac5ec"
+    },
+    {
+      "path": "contracts/test/HunterSecurityCallback.t.sol",
+      "sourceSha256": "5105e6a1fb40982f58b80edff1264c7dcec0dcc5ea24d8acbb6d676f1658805c",
+      "sha256": "f81a67b719cc193cff5b380e1c2d6894d5f75e724ee366aa7bdf111e2803e899"
+    },
+    {
+      "path": "contracts/test/MiningPowerCustody.t.sol",
+      "sourceSha256": "07ff209962df0da69ec40840098214e30275fb063f1d5eaa7baae16e8427261b",
+      "sha256": "0fdc931fb6ba56b47c11a14c7216708f559a0be91b413950a7b94fbbc87d0ecf"
+    },
+    {
+      "path": "contracts/test/MiningPowerCustodyEdges.t.sol",
+      "sourceSha256": "967926d6faf4920c996ecdba5aeec911e86ad52be72bbc7640953a57c97f7917",
+      "sha256": "b9e232a96463969022e650d724e26065e968c8c73301ab9f5a84521bb51f01b8"
+    },
+    {
+      "path": "contracts/test/MiningPowerCustodyInvariant.t.sol",
+      "sourceSha256": "367180d7707fb2a303dcb6746614ebf5ae8ad37020ec939933625a4fd488cdde",
+      "sha256": "989ff72bf00832e60881334910260fd63dacfe4dd435d64d0ec968f58ef9d525"
+    },
+    {
+      "path": "contracts/test/MiningPowerIntegration.t.sol",
+      "sourceSha256": "b568eac897817f075b9e927cb2b05919120bd54aead4f44bcbeb91e6024ec6b3",
+      "sha256": "3da648086db5e8acb126e68f90a1bdea1dd5d90a5986f68f8af27c77993a22e9"
+    },
+    {
+      "path": "contracts/test/WeightedBackingInvariant.t.sol",
+      "sourceSha256": "f1d1b462c87fdccd10a511fb5a8cf5641973a12090eddee51b21b48f31ef66bc",
+      "sha256": "b34721c4308608279819e9aeb8fdd2d2e22e88f60f64cfabd2e5c107781a76dd"
+    },
+    {
+      "path": "contracts/test/WeightedHistory.t.sol",
+      "sourceSha256": "43963906a798c363af09fb505ec21d48a267611053983a9d534d58505c4490ed",
+      "sha256": "b5f314baa578d5a3200f298f1426e07681cadb67ae8e56f54bbef5a855a03d90"
+    },
+    {
+      "path": "contracts/test/WeightedRatioMathCoverage.t.sol",
+      "sourceSha256": "661549766013ff117e62c4cba1d6813d323f95b388a32580dfc1259499fe2f2e",
+      "sha256": "51c4e9ae67986e03b013331e481215a343af57c01b1ee0d562e0f28593d5dcd1"
+    },
+    {
+      "path": "contracts/test/WeightedRewardMathCoverage.t.sol",
+      "sourceSha256": "6a35e570e04606b929f0d773d02ff2cb2db779dc2d337d16670fb343e4063927",
+      "sha256": "0bedee7105bc9d818eb1272ab3b9c301df6bf0460fb94414df9170d6f1b0cd3b"
+    },
+    {
+      "path": "contracts/test/WeightedRoundFundingCallback.t.sol",
+      "sourceSha256": "33396d858e4362bc63d9f9c0758d33fab7ff8c3e3088b129ba0f1084b66a7017",
+      "sha256": "cb88dc351cd763e94796d13a90e10cf89b6d8c5aedb9ca043456b09284113778"
+    },
+    {
+      "path": "contracts/test/WeightedRoundFundingControls.t.sol",
+      "sourceSha256": "529c1fc683159a9ec8e9a8ebe78a69a221aac7c7c8bdd0148f2b64c370f4e5ac",
+      "sha256": "28b3c857d292eea4169dab38c475f4f7308da5a725f51698457480a64fff94d5"
+    },
+    {
+      "path": "contracts/test/WeightedRoundFundingCore.t.sol",
+      "sourceSha256": "7d213e7ded4aed122db987e84cac28233ca86399eb2ec189e95ff07d5489ac41",
+      "sha256": "cf63c2c722d672c7ad6498be499f9df65ee50b71680fa0afc3f0f2d5657d6239"
+    },
+    {
+      "path": "contracts/test/WeightedRoundFundingEdges.t.sol",
+      "sourceSha256": "07338512433ee8bd70974f49d2bd93c0ae0a24dd4f1bb298af7bf2d6b2933013",
+      "sha256": "1d7be075b4a32779c234f082eb988480a3d4e3d710a0666880987c1628cf157c"
+    },
+    {
+      "path": "contracts/test/WeightedRoundFundingHostile.t.sol",
+      "sourceSha256": "b88a440d6d1de094b49d4b4fbde8bfcd5c8b00d5a196223c58c185c1ef017015",
+      "sha256": "8d2745e487497e2f6f8ac7706788f37792f6aa709a543d6dc488e03b5e3eb782"
+    },
+    {
+      "path": "contracts/test/WeightedRoundLedgerConfig.t.sol",
+      "sourceSha256": "2b07f563068ffc9012027f8b5ba92488954521cd8db151f059d52ab626578a00",
+      "sha256": "956090440f546b4f5cfcad342757a42aace43b69d1485178662c526023b30d9f"
+    },
+    {
+      "path": "contracts/test/WeightedRoundLedgerCore.t.sol",
+      "sourceSha256": "c6ef48a1a6860e841c8664cf063bd6250ecfabeca4c3559382e24430202742d3",
+      "sha256": "8a3d9b404df77feaf588245d0952d57fc6959dd1df2c9de3deadc60ad3c53a84"
+    },
+    {
+      "path": "contracts/test/WeightedRoundLedgerCutoff.t.sol",
+      "sourceSha256": "1461dcc81b50d2e19b284af4738a35949d7d69e4675b1f1af1bd2ec63b52ce79",
+      "sha256": "ca3856a46f643c133bd4740720d83310f4fa17075786e2253664de630ee15b98"
+    },
+    {
+      "path": "contracts/test/WeightedRoundLedgerEdges.t.sol",
+      "sourceSha256": "cbffd34cf3c72a49dbc120662dd20b6aae6e8947a74529e6a254d3171ac2a7f5",
+      "sha256": "c7971ff91aabea9b263b13ab8058bd139ca2e7a010cc7a87030d611aca21a8b4"
+    },
+    {
+      "path": "contracts/test/WeightedRoundLedgerReceipts.t.sol",
+      "sourceSha256": "30dbae93e0215a9215c95fb3c6d8cd1cab8635e7bdeeb4919c242af44af03e80",
+      "sha256": "e5a19e42dabcfaf1e616ddb88aa1c40a3984282e88e894d8eafbb14e5be74ae5"
+    },
+    {
+      "path": "contracts/test/WeightedRoundLedgerSnapshots.t.sol",
+      "sourceSha256": "b24028fa812d2753aa4a432a201083f9c6badcffa580d34009212e5bd816768f",
+      "sha256": "c6ece1dadc596d6343b0c5b111f5b2e17c262a86054947f75a0633449e9117f8"
+    },
+    {
+      "path": "contracts/test/WeightedRoundLedgerWide.t.sol",
+      "sourceSha256": "c6cf026a5f60afc8a06f5a7cb6909bce30b0cbb4a96e07fe3bc5b6aede0fde92",
+      "sha256": "9ca387641dc325946f9d6074ff212ffeaa5594965f53e0267efc49e56c565bde"
+    },
+    {
+      "path": "contracts/test/WeightedRoundMaterialisationBurn.t.sol",
+      "sourceSha256": "eaf71edb3e64c77d28f07e11d2e5d8a5b988cb8e746098a78d14e079cde4fb74",
+      "sha256": "5045a2487a08448113741f64472bebf77a50fec9d8def1586a7f757f9e6a23d0"
+    },
+    {
+      "path": "contracts/test/WeightedRoundMaterialisationCore.t.sol",
+      "sourceSha256": "95513d20e1e1d51cdbe9e3319116e4ee56cf54a7ebf5b2edd44dace9969d8560",
+      "sha256": "572edfb6f52d7b92cff276d9a416d5e3991ac29e523dfcf3b342ba755163b9eb"
+    },
+    {
+      "path": "contracts/test/WeightedRoundMaterialisationEdges.t.sol",
+      "sourceSha256": "5513eea0b7ab80a970cae95c951a00179ef38d3af8c27ce633a4f10691548330",
+      "sha256": "036cef302ba14311c383318d2df9295ebde6f6e026d550717fba8a7e91101491"
+    },
+    {
+      "path": "contracts/test/WeightedRoundMaterialisationWiring.t.sol",
+      "sourceSha256": "ee1a99bd09319de21b1cd07b6b72061cbc4e387f52ab3d3dd6aeeb1da1b9e7c7",
+      "sha256": "e08ec05dc0547743b9792c2c815cdc36fd0d58b812182cfd40a5853b310bffdb"
+    },
+    {
+      "path": "contracts/test/helpers/HunterReserveFixtures.sol",
+      "sourceSha256": "e08fb54f1150806e4ee056fe3c5e1993ff331debd60aadafcb92a035ec17ad30",
+      "sha256": "4b313c7defe83018886ce1627ea828490c111345b767a81663a2043e7cdbfefe"
+    }
+  ]
+}

@@ -1,0 +1,14 @@
+.DS_Store
+.env
+.env.*
+*.pem
+*.key
+*.keystore
+*.log
+node_modules/
+**/out/
+**/cache/
+**/broadcast/
+**/deployment-proofs/
+**/coverage/
+**/lcov.info

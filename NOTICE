@@ -1,0 +1,15 @@
+Hunter Bloom
+Copyright (c) 2026 vltgoblin
+
+Developed and maintained by vltgoblin.
+Project: https://proofhunter.fun/
+Maintainer: https://github.com/vltgoblin
+
+Hunter Bloom is licensed under the Apache License, Version 2.0.
+See LICENSE for the full terms.
+
+This distribution references third-party libraries with separate licenses:
+OpenZeppelin Contracts: Copyright (c) 2016-2026 Zeppelin Group Ltd; MIT.
+Forge Standard Library: Copyright Contributors to Forge Standard Library;
+MIT or Apache-2.0.
+See NOTICE.md and the dependency license files for details.
