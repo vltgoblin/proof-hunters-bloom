@@ -85,6 +85,15 @@ interface IPrefundedLifecycleView {
 ///   when `assignedOf[wallet]` reaches 0, by unassign or by locks). As
 ///   before, a depositor backs one wallet at a time (`MustUnassignFirst`)
 ///   and never itself (`SelfAssignment`).
+/// - Backer slot hygiene (S8, decisions 8 and 9): the FIRST assign to an
+///   unbacked wallet must be at least `MIN_STAKE` (`FirstAssignBelowMinimum`)
+///   so the slot cannot be squatted for one wei; a backer whose stake has
+///   since fallen below `MIN_STAKE` (locks, partial exits) can be evicted by
+///   the mining wallet itself (`evictBacker`). A new backer is also refused
+///   while the wallet still has removed stake counting in the open challenge
+///   (`WalletHasCountingRemoval`) — otherwise the newcomer's pending stake
+///   would pay the lock of a win admitted on the previous backer's removed
+///   stake.
 /// - Floor rule: a wallet is eligible while its frozen stake for the
 ///   challenge is >= `MIN_STAKE`, and each win consumes `LOCK_PER_MINT` of
 ///   the live assigned stake, so stake `MIN_STAKE + (n - 1) * LOCK_PER_MINT`
@@ -96,12 +105,41 @@ interface IPrefundedLifecycleView {
 ///   differ only by the removals added back (`removingOf`) and pending
 ///   assigns, so a wallet whose backer unassigned matured stake mid-challenge
 ///   can pass the gate yet have less than `LOCK_PER_MINT` live: that
-///   acceptance reverts `InsufficientFunds` and the proof is rejected. Held
-///   stake (`heldBy`) sits in the backer's unassigned balance, not in
-///   `assignedOf`, so it can keep counting for the challenge but can never be
-///   locked.
+///   acceptance reverts `InsufficientFunds` and the proof is rejected
+///   (`eligibilityOf` previews this as reason 4). Held stake (`heldBy`) sits
+///   in the backer's unassigned balance, not in `assignedOf`, so it can keep
+///   counting for the challenge but can never be locked.
 ///
-/// Slice status (S7): the stake ledger is live — `deposit`, `assign`,
+/// Terminal states and exits (S8):
+/// - Retired (terminal detach: `stopMining`, `tripMining` or mint-out) and
+///   failsafe (`gateDisabled`): every stake exit opens at once — the exit
+///   cooldown and the stake hold are waived — and nothing new can enter:
+///   `deposit` and `assign` revert (`Retired` / `GateDisabled`), since no
+///   new stake could ever back a proof. `unassign`, `evictBacker`,
+///   `withdraw` and the claims stay open forever.
+/// - Non-terminal detach (`wired == false`, not retired): `assign` reverts
+///   `NotWired`, the exit cooldown still applies (stake may not hop to a
+///   replacement module early), the stake hold is waived for the open epoch
+///   (`holdWaivedEpoch`), and `deposit` stays open (a fresh, never-attached
+///   module is prefunded this way).
+/// - The cooldown is wall-clock only, so even a module whose core never
+///   accepts another proof (no miner, stalled chain of seeds) releases every
+///   assignment `EXIT_COOLDOWN` after its last assign.
+/// - After the core's `MINING_STOP_SUNSET` the stop multisig can neither
+///   detach nor replace this module (`setMiningPower` reverts), so it stays
+///   the gate for the rest of mining; the failsafe is the only relief.
+///
+/// Failsafe (S8): `disableRequirement`, callable once and only by the
+/// immutable `FAILSAFE_GUARDIAN` (address(0) = no failsafe, the call always
+/// reverts), sets `gateDisabled` for good. It moves no funds and has no time
+/// limit (it works after the sunset). From then on the gate runs no check
+/// and writes no note, so mining is free again on this module and no new
+/// lock is ever taken; every stake exit opens (cooldown and hold waived);
+/// `deposit` and `assign` are refused. Existing locks are untouched and stay
+/// claimable only through the burn of their NFT, exactly as before. It never
+/// overrides solvency: corrupted totals still block every exit.
+///
+/// Slice status (S8): the stake ledger is live — `deposit`, `assign`,
 /// `unassign` and `withdraw` port `MiningPowerCustody`'s accounting (pending
 /// and removing buckets, per-depositor pending share, per-wallet lazy freeze)
 /// with a wall-clock `EXIT_COOLDOWN` in place of the old 12-proof unlock
@@ -119,7 +157,8 @@ interface IPrefundedLifecycleView {
 /// `claimCommittedTo` pay its lock to the lifecycle's `finalBeneficiary`
 /// (the owner who burned it), so the companion right follows the NFT through
 /// transfers, sales and loan defaults and is never bound to the original
-/// miner or its backer. The failsafe entry point (S8) is not implemented yet.
+/// miner or its backer. Exits, terminal states and the failsafe (S8) are
+/// live (see above).
 /// Challenge bookkeeping (`wired`, `retired`, `latestChallengeId`,
 /// `lastAcceptedProofs`) mirrors `MiningPowerCustody` exactly so the module
 /// is a drop-in for the core.
@@ -185,6 +224,9 @@ contract PrefundedMiningPower is IMiningPower, ReentrancyGuard {
     error InvalidConfiguration();
     error StakeHeldUntilNextChallenge(uint256 held, uint256 epoch);
     error WalletAlreadyBacked(address backer);
+    error FirstAssignBelowMinimum(uint256 amount, uint256 minStake);
+    error WalletHasCountingRemoval(uint256 removing);
+    error BackerNotEvictable(uint256 assigned, uint256 minStake);
 
     event Deposited(address indexed depositor, uint256 amount);
     event Assigned(address indexed depositor, address indexed miningWallet, uint256 amount, uint256 timestamp);
@@ -202,6 +244,7 @@ contract PrefundedMiningPower is IMiningPower, ReentrancyGuard {
     event ChallengeSnapshotted(uint256 indexed challengeId);
     event ProofProgress(uint256 acceptedProofs);
     event RequirementDisabled(address indexed guardian);
+    event BackerEvicted(address indexed miningWallet, address indexed backer, uint256 amount);
 
     uint256 private constant _WAD = 1e18;
     uint256 private constant _SLOPE_WAD = 5e17; // 0.5
@@ -477,12 +520,17 @@ contract PrefundedMiningPower is IMiningPower, ReentrancyGuard {
     // Stake ledger (S4) — port of MiningPowerCustody
     // ------------------------------------------------------------------
 
-    /// @notice Deposit HUNTER as unassigned stake. Allowed in every state —
-    /// an unassigned deposit carries no power and can always be withdrawn.
+    /// @notice Deposit HUNTER as unassigned stake. Allowed before attach and
+    /// while detached (an unassigned deposit carries no power and can always
+    /// be withdrawn), but refused once the module is retired (`Retired`) or
+    /// the failsafe fired (`GateDisabled`): no new stake could ever back a
+    /// proof on it.
     /// @dev Credits the measured balance delta. A zero receipt, a receipt
     /// larger than `amount` (S0 default 5) or a balance that shrinks reverts
     /// `UnsupportedTokenReceipt`. Solvency is checked before and after.
     function deposit(uint256 amount) external nonReentrant {
+        if (retired) revert Retired();
+        if (gateDisabled) revert GateDisabled();
         if (amount == 0) revert ZeroAmount();
         uint256 beforeBal = _requireSolvent();
         HUNTER.safeTransferFrom(msg.sender, address(this), amount);
@@ -504,6 +552,21 @@ contract PrefundedMiningPower is IMiningPower, ReentrancyGuard {
     /// its own mining wallet (S0 default 6), and a wallet has one backer at a
     /// time: while it has assigned stake, only that backer may add to it
     /// (`WalletAlreadyBacked`).
+    /// Taking an empty backer slot (S8) has two more conditions; a top-up by
+    /// the current backer has neither:
+    /// - Decision 8: the first assign must be at least `MIN_STAKE`
+    ///   (`FirstAssignBelowMinimum`). Otherwise one wei would squat the slot
+    ///   and lock the wallet's real backer out for free. `MIN_STAKE` is the
+    ///   threshold because it is the least stake that can make the wallet
+    ///   eligible; anything below it can only block. A backer that later
+    ///   drops below it can be evicted by the wallet (`evictBacker`).
+    /// - Decision 9: refused while the wallet still has matured stake removed
+    ///   in the open challenge that counts for it (`removingOf`, unless a
+    ///   detach waived that epoch) — `WalletHasCountingRemoval`. The gate
+    ///   admits on that removed stake, and settlement charges the live
+    ///   backer, so the newcomer (whose own stake is pending and never
+    ///   counted) would pay the lock of a win it did not qualify. The slot
+    ///   reopens with the next snapshot.
     function assign(address miningWallet, uint256 amount) external nonReentrant {
         // `retired` is checked first: a terminal detach also clears `wired`,
         // so checking `wired` first would make `Retired` unreachable.
@@ -516,10 +579,19 @@ contract PrefundedMiningPower is IMiningPower, ReentrancyGuard {
         address current = assigneeOf[msg.sender];
         if (current != address(0) && current != miningWallet) revert MustUnassignFirst(current);
         address backer = backerOf[miningWallet];
-        if (assignedOf[miningWallet] != 0 && backer != msg.sender) revert WalletAlreadyBacked(backer);
+        if (assignedOf[miningWallet] != 0) {
+            if (backer != msg.sender) revert WalletAlreadyBacked(backer);
+        } else {
+            if (amount < MIN_STAKE) revert FirstAssignBelowMinimum(amount, MIN_STAKE);
+            uint256 latest = latestChallengeId;
+            uint256 removing = removingOf[miningWallet];
+            if (pendingEpoch[miningWallet] == latest && removing != 0 && latest != holdWaivedEpoch) {
+                revert WalletHasCountingRemoval(removing);
+            }
+        }
         uint256 available = unassignedOf[msg.sender];
         if (amount > available) revert InsufficientUnassigned(available, amount);
-        _retagBuckets(miningWallet);
+        _retagBuckets(miningWallet, msg.sender);
         unassignedOf[msg.sender] = available - amount;
         assignedOf[miningWallet] += amount;
         assignedBy[msg.sender] += amount;
@@ -553,19 +625,36 @@ contract PrefundedMiningPower is IMiningPower, ReentrancyGuard {
         uint256 available = assignedBy[msg.sender];
         if (amount > available) revert InsufficientAssigned(available, amount);
         _requireSolvent();
-        _retagBuckets(miningWallet);
-        uint256 pendingPart = pendingBy[msg.sender] < amount ? pendingBy[msg.sender] : amount;
-        pendingBy[msg.sender] -= pendingPart;
-        pendingOf[miningWallet] -= pendingPart;
-        removingOf[miningWallet] += amount - pendingPart;
-        heldBy[msg.sender] += amount - pendingPart;
-        assignedBy[msg.sender] = available - amount;
-        assignedOf[miningWallet] -= amount;
-        totalAssigned -= amount;
-        unassignedOf[msg.sender] += amount;
-        if (assignedBy[msg.sender] == 0) assigneeOf[msg.sender] = address(0);
-        if (assignedOf[miningWallet] == 0) backerOf[miningWallet] = address(0);
-        emit Unassigned(msg.sender, miningWallet, amount, block.timestamp);
+        _unassignFrom(msg.sender, miningWallet, amount);
+    }
+
+    /// @notice The mining wallet evicts its own backer once that backer's
+    /// stake on it is below `MIN_STAKE` (S8, decision 8): the backer's whole
+    /// assignment returns to the backer's unassigned balance and the slot is
+    /// free again. Only `miningWallet` itself may call it, and only while
+    /// `0 < assignedOf[miningWallet] < MIN_STAKE` (`BackerNotEvictable`).
+    /// @dev Why: the first-assign minimum stops a one-wei squat, but a backer
+    /// can still fall below the floor later (locks, partial exits) and sit
+    /// in the slot with stake that can never make the wallet eligible again,
+    /// locking out anyone who would. Why `MIN_STAKE`: at or above it the
+    /// backer can still qualify the wallet, so the wallet has no business
+    /// removing it; below it the backer can only block.
+    /// Bookkeeping is exactly `unassign`'s for the backer (pending part
+    /// first; the matured part is queued in `removingOf` and held in the
+    /// module via `heldBy` until the next snapshot, since it still counts for
+    /// the open challenge), and it emits `Unassigned` as well as
+    /// `BackerEvicted`. There is no cooldown check: the caller is not the
+    /// depositor, and a squatter could otherwise keep resetting its own
+    /// clock with one-wei top-ups. Moves no tokens; fails closed on
+    /// insolvency like every other exit. Allowed in every state.
+    function evictBacker(address miningWallet) external nonReentrant {
+        if (msg.sender != miningWallet) revert UnauthorizedCaller(msg.sender);
+        uint256 amount = assignedOf[miningWallet];
+        if (amount == 0 || amount >= MIN_STAKE) revert BackerNotEvictable(amount, MIN_STAKE);
+        address backer = backerOf[miningWallet];
+        _requireSolvent();
+        _unassignFrom(backer, miningWallet, amount);
+        emit BackerEvicted(miningWallet, backer, amount);
     }
 
     /// @notice Withdraw unassigned stake. Allowed in every state, but only
@@ -591,6 +680,33 @@ contract PrefundedMiningPower is IMiningPower, ReentrancyGuard {
         if (afterBal > beforeBal || beforeBal - afterBal != amount) revert DebitMismatch();
         _requireSolvent();
         emit Withdrawn(msg.sender, amount);
+    }
+
+    // ------------------------------------------------------------------
+    // Failsafe (S8)
+    // ------------------------------------------------------------------
+
+    /// @notice One-way failsafe: waives the stake requirement for good.
+    /// Callable only by `FAILSAFE_GUARDIAN` (`UnauthorizedCaller` for anyone
+    /// else, and for everyone when the guardian is address(0) — no failsafe),
+    /// and only once (`GateDisabled` afterwards).
+    /// @dev Only sets `gateDisabled` and emits `RequirementDisabled`; it moves
+    /// no funds and touches no balance, stake or lock. No time check: it
+    /// works after the core's stop sunset, when nobody can detach the module
+    /// any more. Its effects are all read from the flag elsewhere: the gate
+    /// runs no check and writes no note, so mining is free again on this
+    /// module and no new lock is taken; `assign` and `deposit` are refused;
+    /// the exit cooldown and the stake hold are waived, so every staker can
+    /// `unassign` and `withdraw` at once. Existing locks stay claimable, as
+    /// always, only through the burn of their NFT (`claimCommitted`).
+    /// Solvency checks still apply: a module with corrupted totals stays
+    /// frozen rather than paying out.
+    function disableRequirement() external {
+        address guardian = FAILSAFE_GUARDIAN;
+        if (guardian == address(0) || msg.sender != guardian) revert UnauthorizedCaller(msg.sender);
+        if (gateDisabled) revert GateDisabled();
+        gateDisabled = true;
+        emit RequirementDisabled(msg.sender);
     }
 
     // ------------------------------------------------------------------
@@ -621,19 +737,28 @@ contract PrefundedMiningPower is IMiningPower, ReentrancyGuard {
     /// @notice What the gate would decide for `wallet` in the current
     /// (latest snapshotted) challenge, without freezing anything.
     /// @dev `stake` is exactly what `_freeze` would record (or has recorded)
-    /// for `latestChallengeId` — what the gate compares. Reason codes: 0 ok,
-    /// 1 this module is not the live one (not wired, or retired), 2 stake
-    /// below `MIN_STAKE`. Once the failsafe fired a wired module reports
-    /// eligible (reason 0). Like the gate, this does not check the live
-    /// assigned stake a win is paid from: a wallet whose backer unassigned
-    /// matured stake this challenge can read eligible while `assignedOf` is
-    /// below `LOCK_PER_MINT`, and its acceptance would revert
-    /// `InsufficientFunds`.
+    /// for `latestChallengeId` — what the gate compares. Reason codes:
+    /// - 0 eligible: an accepted proof would mint and settle its lock (once
+    ///   the failsafe fired a wired module always reports 0 — no check, no
+    ///   lock);
+    /// - 1 this module is not the live one (not wired, or retired);
+    /// - 2 frozen stake below `MIN_STAKE` (the gate reverts `NotEligible(2)`);
+    /// - 3 unused (the retired two-bucket "funds below lock" code, kept
+    ///   reserved so the other codes stay stable);
+    /// - 4 frozen stake passes but the LIVE stake the lock is paid from,
+    ///   `min(assignedOf[wallet], assignedBy[backerOf[wallet]])`, is below
+    ///   `LOCK_PER_MINT` (a backer unassigned matured stake this challenge).
+    ///   The gate itself still admits such a wallet — it only looks at the
+    ///   frozen stake — and settlement then fails closed (`InsufficientFunds`,
+    ///   the proof is rejected). Reason 4 is a client preview only.
     function eligibilityOf(address wallet) external view returns (bool eligible, uint8 reason, uint256 stake) {
         stake = _frozenPreview(wallet);
         if (!wired || retired) return (false, 1, stake);
         if (gateDisabled) return (true, 0, stake);
         if (stake < MIN_STAKE) return (false, 2, stake);
+        address backer = backerOf[wallet];
+        uint256 backerStake = backer == address(0) ? 0 : assignedBy[backer];
+        if (Math.min(assignedOf[wallet], backerStake) < LOCK_PER_MINT) return (false, 4, stake);
         return (true, 0, stake);
     }
 
@@ -828,23 +953,47 @@ contract PrefundedMiningPower is IMiningPower, ReentrancyGuard {
         return lifecycle.finalBeneficiary(tokenId);
     }
 
+    /// @dev Returns `amount` of `depositor`'s assignment on `miningWallet` to
+    /// `depositor`'s unassigned balance. Shared by `unassign` (depositor ==
+    /// caller) and `evictBacker` (depositor == the wallet's backer); callers
+    /// check authorization, amount and solvency first. The depositor's own
+    /// still-pending share leaves first; the matured remainder is queued in
+    /// `removingOf` (it still counts for the open challenge) and held
+    /// (`heldBy`) until the next snapshot.
+    function _unassignFrom(address depositor, address miningWallet, uint256 amount) private {
+        _retagBuckets(miningWallet, depositor);
+        uint256 pendingPart = pendingBy[depositor] < amount ? pendingBy[depositor] : amount;
+        pendingBy[depositor] -= pendingPart;
+        pendingOf[miningWallet] -= pendingPart;
+        removingOf[miningWallet] += amount - pendingPart;
+        heldBy[depositor] += amount - pendingPart;
+        assignedBy[depositor] -= amount;
+        assignedOf[miningWallet] -= amount;
+        totalAssigned -= amount;
+        unassignedOf[depositor] += amount;
+        if (assignedBy[depositor] == 0) assigneeOf[depositor] = address(0);
+        if (assignedOf[miningWallet] == 0) backerOf[miningWallet] = address(0);
+        emit Unassigned(depositor, miningWallet, amount, block.timestamp);
+    }
+
     /// @dev Pending from an older epoch has matured and queued removals have
-    /// landed; retag the wallet's buckets and the caller's pending share to
-    /// the latest challenge before recording an assign or unassign against it.
-    function _retagBuckets(address miningWallet) private {
+    /// landed; retag the wallet's buckets and `depositor`'s pending share and
+    /// hold to the latest challenge before recording an assign or unassign
+    /// against it.
+    function _retagBuckets(address miningWallet, address depositor) private {
         uint256 latest = latestChallengeId;
         if (pendingEpoch[miningWallet] < latest) {
             pendingOf[miningWallet] = 0;
             removingOf[miningWallet] = 0;
             pendingEpoch[miningWallet] = latest;
         }
-        if (pendingEpochBy[msg.sender] < latest) {
-            pendingBy[msg.sender] = 0;
-            pendingEpochBy[msg.sender] = latest;
+        if (pendingEpochBy[depositor] < latest) {
+            pendingBy[depositor] = 0;
+            pendingEpochBy[depositor] = latest;
         }
-        if (heldEpochBy[msg.sender] < latest) {
-            heldBy[msg.sender] = 0;
-            heldEpochBy[msg.sender] = latest;
+        if (heldEpochBy[depositor] < latest) {
+            heldBy[depositor] = 0;
+            heldEpochBy[depositor] = latest;
         }
     }
 

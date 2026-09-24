@@ -171,6 +171,7 @@ contract PrefundedMiningPowerHostileTest is PrefundedMiningStack {
 
     uint256 private constant LOCK = 100e18;
     uint256 private constant COOLDOWN = 1 hours;
+    address private constant GUARDIAN = address(0x6A2D);
 
     function setUp() public override {
         super.setUp();
@@ -386,7 +387,13 @@ contract PrefundedMiningPowerHostileTest is PrefundedMiningStack {
         _assertBooks();
     }
 
+    /// @dev S8: the module carries a failsafe guardian, and firing the
+    /// failsafe on a corrupted module does not unblock anything — it waives
+    /// the cooldown and hold, never the solvency check.
     function testCorruptedTotalsBlockEveryExit() public {
+        _detach();
+        _deployModule(LOCK, LOCK, COOLDOWN, 0, GUARDIAN);
+        _attach(module);
         _deposit(ALICE, 1_000e18);
         _assign(ALICE, MINER, 400e18);
         vm.warp(block.timestamp + COOLDOWN);
@@ -422,6 +429,29 @@ contract PrefundedMiningPowerHostileTest is PrefundedMiningStack {
 
             stdstore.target(address(module)).sig(totals[i]).checked_write(original);
         }
+
+        // S8: the failsafe fires on a corrupted module (it moves no funds and
+        // reads no balance), but exits stay blocked by the solvency check
+        // and new stake is refused by the failsafe itself.
+        stdstore.target(address(module)).sig("totalStake()").checked_write(bal + 1);
+        vm.prank(GUARDIAN);
+        module.disableRequirement();
+        assertTrue(module.gateDisabled());
+        assertEq(token.balanceOf(address(module)), bal);
+        vm.prank(ALICE);
+        vm.expectRevert(PrefundedMiningPower.Insolvency.selector);
+        module.unassign(MINER, 400e18);
+        vm.prank(ALICE);
+        vm.expectRevert(PrefundedMiningPower.Insolvency.selector);
+        module.withdraw(600e18);
+        vm.prank(BOB);
+        vm.expectRevert(PrefundedMiningPower.GateDisabled.selector);
+        module.deposit(10e18);
+        assertEq(token.balanceOf(address(module)), bal);
+        assertEq(module.assignedBy(ALICE), 400e18);
+        assertEq(module.unassignedOf(ALICE), 600e18);
+        assertEq(token.balanceOf(ALICE), 0);
+        stdstore.target(address(module)).sig("totalStake()").checked_write(uint256(1_000e18));
 
         // With honest totals every exit works again.
         _unassign(ALICE, MINER, 400e18);

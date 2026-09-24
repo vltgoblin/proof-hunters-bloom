@@ -364,6 +364,7 @@ contract PrefundedMiningPowerSettlementTest is PrefundedMiningStack {
     uint256 private constant MIN_STAKE = 1_000e18;
     uint256 private constant LOCK = 100e18;
     uint256 private constant BONUS_UNIT = 1_000_000e18;
+    address private constant GUARDIAN = address(0x6A2D);
 
     function setUp() public override {
         super.setUp();
@@ -414,8 +415,13 @@ contract PrefundedMiningPowerSettlementTest is PrefundedMiningStack {
         _activate();
         _assertGateRejectsWithoutSideEffects(MINER);
 
-        // (b) matured stake one wei below MIN_STAKE.
-        _qualify(ALICE, MINER2, MIN_STAKE - 1);
+        // (b) matured stake one wei below MIN_STAKE. S8: a first assign must
+        // reach MIN_STAKE, so one wei leaves again and the next challenge
+        // freezes MIN_STAKE - 1.
+        _qualify(ALICE, MINER2, MIN_STAKE);
+        _unassign(ALICE, MINER2, 1);
+        _nextChallenge();
+        _activate();
         (bool eligible, uint8 reason, uint256 stake) = module.eligibilityOf(MINER2);
         assertFalse(eligible);
         assertEq(reason, 2);
@@ -540,7 +546,8 @@ contract PrefundedMiningPowerSettlementTest is PrefundedMiningStack {
 
         _unassign(ALICE, MINER, MIN_STAKE);
         _assign(ALICE, MINER2, MIN_STAKE);
-        _assertEligibility(MINER, true, 0, MIN_STAKE);
+        // S8 reason 4: frozen MIN_STAKE still admits, the live stake is 0.
+        _assertEligibility(MINER, false, 4, MIN_STAKE);
         _assertEligibility(MINER2, false, 2, 0);
         (uint256 nonce,) = _nonce(MINER2);
         _expectNotEligible(2);
@@ -696,8 +703,9 @@ contract PrefundedMiningPowerSettlementTest is PrefundedMiningStack {
         assertEq(m.backerOf(MINER), address(0));
 
         PrefundedMiningPower off =
-            new PrefundedMiningPower(address(token), address(probeCore), MIN_STAKE, LOCK, 0, 0, address(0));
-        stdstore.enable_packed_slots().target(address(off)).sig("gateDisabled()").checked_write(true);
+            new PrefundedMiningPower(address(token), address(probeCore), MIN_STAKE, LOCK, 0, 0, GUARDIAN);
+        vm.prank(GUARDIAN);
+        off.disableRequirement();
         (noteDuring, minerDuring,,) = probeCore.probe(off, 7, MINER);
         assertEq(noteDuring, 0);
         assertEq(minerDuring, address(0));
@@ -706,6 +714,9 @@ contract PrefundedMiningPowerSettlementTest is PrefundedMiningStack {
     }
 
     function testEligibilityReasonOneWhenModuleNotLive() public {
+        _detach();
+        _deployModule(MIN_STAKE, LOCK, 0, 0, GUARDIAN);
+        _attach(module);
         _qualify(ALICE, MINER, MIN_STAKE);
         _assertEligibility(MINER, true, 0, MIN_STAKE);
 
@@ -728,7 +739,8 @@ contract PrefundedMiningPowerSettlementTest is PrefundedMiningStack {
         vm.prank(STOP);
         core.stopMining();
         assertTrue(module.retired());
-        stdstore.enable_packed_slots().target(address(module)).sig("gateDisabled()").checked_write(true);
+        vm.prank(GUARDIAN);
+        module.disableRequirement();
         (eligible, reason,) = module.eligibilityOf(MINER);
         assertFalse(eligible);
         assertEq(reason, 1);
@@ -742,13 +754,33 @@ contract PrefundedMiningPowerSettlementTest is PrefundedMiningStack {
         uint256 topUp = bound(topUpSeed, 0, 3 * LOCK);
         if (amount != 0) {
             _deposit(ALICE, amount);
-            _assign(ALICE, MINER, amount);
+            if (amount < MIN_STAKE) {
+                // S8: a first assign below MIN_STAKE is refused outright.
+                vm.prank(ALICE);
+                vm.expectRevert(
+                    abi.encodeWithSelector(PrefundedMiningPower.FirstAssignBelowMinimum.selector, amount, MIN_STAKE)
+                );
+                module.assign(MINER, amount);
+                amount = 0;
+            } else {
+                _assign(ALICE, MINER, amount);
+            }
         }
         if (matured) _nextChallenge();
         _activate();
         if (topUp != 0) {
             _deposit(ALICE, topUp);
-            _assign(ALICE, MINER, topUp);
+            if (amount == 0) {
+                // Still a first assign (topUp <= 3L < MIN_STAKE): refused.
+                vm.prank(ALICE);
+                vm.expectRevert(
+                    abi.encodeWithSelector(PrefundedMiningPower.FirstAssignBelowMinimum.selector, topUp, MIN_STAKE)
+                );
+                module.assign(MINER, topUp);
+                topUp = 0;
+            } else {
+                _assign(ALICE, MINER, topUp);
+            }
         }
 
         uint256 frozen = matured ? amount : 0;
@@ -826,15 +858,18 @@ contract PrefundedMiningPowerSettlementTest is PrefundedMiningStack {
         _assertNoteEmpty();
     }
 
-    /// @dev S8's `disableRequirement` does not exist yet; the failsafe flag is
-    /// injected with stdstore.
+    /// @dev The failsafe fired through S8's `disableRequirement`.
     function testGateDisabledSkipsChecksAndWritesNoNote() public {
+        _detach();
+        _deployModule(MIN_STAKE, LOCK, 0, 0, GUARDIAN);
+        _attach(module);
         _activate();
         (uint256 nonce,) = _nonce(MINER);
         _expectNotEligible(2);
         _send(MINER, nonce);
 
-        stdstore.enable_packed_slots().target(address(module)).sig("gateDisabled()").checked_write(true);
+        vm.prank(GUARDIAN);
+        module.disableRequirement();
         assertTrue(module.gateDisabled());
         _assertEligibility(MINER, true, 0, 0);
         uint256 tokenId = _win(MINER);
@@ -961,7 +996,9 @@ contract PrefundedMiningPowerSettlementTest is PrefundedMiningStack {
         assertEq(module.assignedOf(MINER), LOCK - 1);
         assertEq(module.removingOf(MINER), MIN_STAKE);
         assertEq(module.heldStakeOf(ALICE), MIN_STAKE);
-        _assertEligibility(MINER, true, 0, MIN_STAKE + LOCK - 1);
+        // S8 reason 4: the gate admits on the frozen stake, the live stake
+        // (L - 1) cannot pay the lock.
+        _assertEligibility(MINER, false, 4, MIN_STAKE + LOCK - 1);
 
         Snap memory s0 = _snap(MINER);
         (uint256 nonce,) = _nonce(MINER);
@@ -1029,60 +1066,10 @@ contract PrefundedMiningPowerSettlementTest is PrefundedMiningStack {
         _assertBooks();
     }
 
-    /// @notice LIMITATION (frozen vs live across backers): the gate admits
-    /// on the wallet's frozen stake, which still includes a previous backer's
-    /// matured stake unassigned this challenge, while the lock is paid from
-    /// whoever backs the wallet NOW. ALICE's removed MIN_STAKE qualifies
-    /// MINER; BOB, who backs the freed wallet mid-challenge with one lock's
-    /// worth (pending — it never counted for this challenge), pays the lock.
-    /// Nothing is lost to the module (the lock goes to the NFT's final
-    /// beneficiary on burn), but BOB is charged for a win his stake did not
-    /// qualify.
-    function testLimitation_NewBackerPaysWinAdmittedOnRemovedStake() public {
-        _qualify(ALICE, MINER, MIN_STAKE);
-        _unassign(ALICE, MINER, MIN_STAKE);
-        assertEq(module.backerOf(MINER), address(0));
-        _deposit(BOB, LOCK);
-        _assign(BOB, MINER, LOCK);
-        assertEq(module.pendingOf(MINER), LOCK);
-        _assertEligibility(MINER, true, 0, MIN_STAKE);
-
-        uint256 tokenId = _win(MINER);
-        (,,,, address backer,) = module.committedOf(tokenId);
-        assertEq(backer, BOB);
-        assertEq(module.assignedBy(BOB), 0);
-        assertEq(module.pendingOf(MINER), 0);
-        assertEq(module.backerOf(MINER), address(0));
-        assertEq(module.unassignedOf(ALICE), MIN_STAKE);
-        _assertBooks();
-    }
-
-    /// @notice LIMITATION (one funder per wallet): the backer slot is first
-    /// come, first served and the mining wallet has no way to evict a
-    /// backer. A 1-wei assignment by a stranger (CAROL) blocks the wallet's
-    /// intended backer for as long as CAROL keeps it there; it does not make
-    /// the wallet eligible (far below MIN_STAKE). The wallet has to mine
-    /// from another address.
-    function testLimitation_DustBackerSquatsWallet() public {
-        _deposit(CAROL, 1);
-        _assign(CAROL, MINER, 1);
-        _deposit(ALICE, MIN_STAKE);
-        vm.prank(ALICE);
-        vm.expectRevert(abi.encodeWithSelector(PrefundedMiningPower.WalletAlreadyBacked.selector, CAROL));
-        module.assign(MINER, MIN_STAKE);
-        _nextChallenge();
-        _activate();
-        _assertEligibility(MINER, false, 2, 1);
-        // Only CAROL can free the slot.
-        _unassign(CAROL, MINER, 1);
-        _assign(ALICE, MINER, MIN_STAKE);
-        assertEq(module.backerOf(MINER), ALICE);
-        _assertBooks();
-    }
-
     function testSecondBackerRejected() public {
-        _deposit(ALICE, MIN_STAKE);
-        _assign(ALICE, MINER, MIN_STAKE / 2);
+        // S8: the first assign must reach MIN_STAKE; top-ups need not.
+        _deposit(ALICE, MIN_STAKE + MIN_STAKE / 2);
+        _assign(ALICE, MINER, MIN_STAKE);
         assertEq(module.backerOf(MINER), ALICE);
         _deposit(BOB, MIN_STAKE);
         vm.prank(BOB);
@@ -1092,7 +1079,7 @@ contract PrefundedMiningPowerSettlementTest is PrefundedMiningStack {
         // The backer itself tops up freely; BOB backs another wallet.
         _assign(ALICE, MINER, MIN_STAKE / 2);
         _assign(BOB, MINER2, MIN_STAKE);
-        assertEq(module.assignedOf(MINER), MIN_STAKE);
+        assertEq(module.assignedOf(MINER), MIN_STAKE + MIN_STAKE / 2);
         assertEq(module.backerOf(MINER2), BOB);
         _assertBooks();
 
@@ -1103,7 +1090,7 @@ contract PrefundedMiningPowerSettlementTest is PrefundedMiningStack {
         vm.prank(BOB);
         vm.expectRevert(abi.encodeWithSelector(PrefundedMiningPower.WalletAlreadyBacked.selector, ALICE));
         module.assign(MINER, 1);
-        _unassign(ALICE, MINER, MIN_STAKE - 1);
+        _unassign(ALICE, MINER, MIN_STAKE + MIN_STAKE / 2 - 1);
         assertEq(module.backerOf(MINER), address(0));
         _assign(BOB, MINER, MIN_STAKE);
         assertEq(module.backerOf(MINER), BOB);
@@ -1116,7 +1103,7 @@ contract PrefundedMiningPowerSettlementTest is PrefundedMiningStack {
         (,,,, address backer,) = module.committedOf(tokenId);
         assertEq(backer, BOB);
         assertEq(module.assignedBy(BOB), MIN_STAKE - LOCK);
-        assertEq(module.unassignedOf(ALICE), MIN_STAKE);
+        assertEq(module.unassignedOf(ALICE), MIN_STAKE + MIN_STAKE / 2);
         _assertBooks();
     }
 
@@ -1663,8 +1650,8 @@ contract PrefundedMiningPowerSettlementTest is PrefundedMiningStack {
     /// forge-config: default.fuzz.runs = 64
     /// forge-config: release.fuzz.runs = 64
     function testFuzz_LockKeepsPendingWithinBalance(uint256 fuzzSeed) public {
-        _deposit(ALICE, 1);
-        _assign(ALICE, MINER, 1);
+        _deposit(ALICE, MIN_STAKE);
+        _assign(ALICE, MINER, MIN_STAKE);
         uint256 wins;
         for (uint256 i = 0; i < 32; i++) {
             uint256 r = uint256(keccak256(abi.encode(fuzzSeed, i)));
@@ -1673,8 +1660,28 @@ contract PrefundedMiningPowerSettlementTest is PrefundedMiningStack {
             if (op == 0) {
                 // Top-up (pending for the open challenge).
                 _deposit(ALICE, amt);
-                if (module.assigneeOf(ALICE) == address(0) || module.assigneeOf(ALICE) == MINER) {
+                if (module.assigneeOf(ALICE) == MINER) {
                     _assign(ALICE, MINER, amt);
+                } else {
+                    // S8: re-taking the empty slot needs MIN_STAKE and no
+                    // removed stake still counting in the open challenge.
+                    vm.prank(ALICE);
+                    vm.expectRevert(
+                        abi.encodeWithSelector(PrefundedMiningPower.FirstAssignBelowMinimum.selector, amt, MIN_STAKE)
+                    );
+                    module.assign(MINER, amt);
+                    uint256 removing = module.removingOf(MINER);
+                    if (module.pendingEpoch(MINER) == module.latestChallengeId() && removing != 0) {
+                        vm.prank(ALICE);
+                        vm.expectRevert(
+                            abi.encodeWithSelector(PrefundedMiningPower.WalletHasCountingRemoval.selector, removing)
+                        );
+                        module.assign(MINER, MIN_STAKE);
+                    } else {
+                        uint256 free = module.unassignedOf(ALICE);
+                        if (free < MIN_STAKE) _deposit(ALICE, MIN_STAKE - free);
+                        _assign(ALICE, MINER, MIN_STAKE);
+                    }
                 }
             } else if (op == 1) {
                 uint256 assigned = module.assignedBy(ALICE);
@@ -1683,13 +1690,16 @@ contract PrefundedMiningPowerSettlementTest is PrefundedMiningStack {
                 _nextChallenge();
             } else {
                 _activate();
-                (bool eligible,, uint256 frozen) = module.eligibilityOf(MINER);
+                (bool eligible, uint8 reason, uint256 frozen) = module.eligibilityOf(MINER);
                 uint256 live = module.assignedOf(MINER);
                 (uint256 nonce,) = _nonce(MINER);
-                if (!eligible) {
+                assertEq(eligible, reason == 0);
+                if (reason == 2) {
                     _expectNotEligible(2);
                     _send(MINER, nonce);
-                } else if (live < LOCK) {
+                } else if (reason == 4) {
+                    // S8: reason 4 previews exactly the settlement failure.
+                    assertLt(live, LOCK);
                     assertGe(frozen, MIN_STAKE);
                     vm.expectRevert(
                         abi.encodeWithSelector(PrefundedMiningPower.InsufficientFunds.selector, live, LOCK)

@@ -90,7 +90,18 @@ contract PrefundedMiningPowerDifficultyTest is Test {
         for (uint256 i = 0; i < STEPS; i++) {
             uint256 r = uint256(keccak256(abi.encode(seed, i)));
             uint256 op = r % 100;
-            if (op < 45) {
+            // Every schedule exercises every transition at least once: the
+            // first three steps are a forced refresh, a forced ease and a
+            // forced retarget (each asserts it landed on both twins); the
+            // seed still picks the miner and the retarget span, and the rest
+            // of the schedule is random.
+            if (i == 0) {
+                _forceRefresh();
+            } else if (i == 1) {
+                _forceEase();
+            } else if (i == 2) {
+                _forceRetarget(miners[(r >> 8) % 3], (r >> 32) % 40_000);
+            } else if (op < 45) {
                 _acceptOnBoth(miners[(r >> 8) % 3]);
             } else if (op < 70) {
                 vm.roll(block.number + 1 + ((r >> 16) % 300));
@@ -448,6 +459,47 @@ contract PrefundedMiningPowerDifficultyTest is Test {
         coreP.submitProof(id, seedBlock, nonceP, basket);
         vm.prank(miner);
         coreD.submitProof(id, seedBlock, nonceD, basket);
+    }
+
+    /// @dev Rolls past the active seed's readable window, then refreshes on
+    /// both twins; the refresh must land.
+    function _forceRefresh() private {
+        uint256 expiry = coreP.activeSeedParentBlock() + coreP.SEED_READABLE_PARENT_BLOCKS() + 1;
+        if (block.number < expiry) vm.roll(expiry);
+        uint256 before = _refreshes;
+        _refreshOnBoth();
+        assertEq(_refreshes, before + 1, "forced refresh did not land");
+    }
+
+    /// @dev A fresh seed (forced refresh) puts the whole stall interval
+    /// inside its readable window; activate it, roll to the earliest ease
+    /// block and ease on both twins. Called before any ease or retarget, so
+    /// the target is still below MAX_TARGET and the ease must land.
+    function _forceEase() private {
+        _forceRefresh();
+        _activate(coreP);
+        uint256 ref = coreP.lastProofBlock() > coreP.lastEaseBlock() ? coreP.lastProofBlock() : coreP.lastEaseBlock();
+        uint256 earliest = ref + coreP.STALL_INTERVAL_PARENT_BLOCKS();
+        if (earliest > block.number) vm.roll(earliest);
+        assertLt(coreP.currentTarget(), coreP.MAX_TARGET(), "target already at maximum");
+        uint256 before = _eases;
+        _easeOnBoth();
+        assertEq(_eases, before + 1, "forced ease did not land");
+    }
+
+    /// @dev Puts both windows one proof short of closing over a seed-chosen
+    /// span, then accepts one proof from `miner` on both: the retarget must
+    /// fire on both twins (window reset).
+    function _forceRetarget(address miner, uint256 span) private {
+        uint256 start = span >= block.number ? 0 : block.number - span;
+        uint256 count = coreP.RETARGET_WINDOW_PROOFS() - 1;
+        coreP.setWindow(count, start);
+        coreD.setWindow(count, start);
+        uint256 before = _retargets;
+        _acceptOnBoth(miner);
+        assertEq(_retargets, before + 1, "forced retarget did not land");
+        assertEq(coreP.retargetWindowProofs(), 0, "window not reset");
+        assertEq(coreD.retargetWindowProofs(), 0, "twin window not reset");
     }
 
     function _refreshOnBoth() private {
