@@ -52,14 +52,19 @@ interface IPrefundedMiningCoreView {
 /// - S0 default 7: the HUNTER token is a test fixture until the canonical
 ///   token is bound.
 ///
-/// Slice status (S4): the stake ledger is live — `deposit`, `assign`,
+/// Slice status (S5): the stake ledger is live — `deposit`, `assign`,
 /// `unassign` and `withdraw` port `MiningPowerCustody`'s accounting (pending
 /// and removing buckets, per-depositor pending share, per-wallet lazy freeze)
 /// with a wall-clock `EXIT_COOLDOWN` in place of the old 12-proof unlock
-/// delay. `powerMultiplierWad` freezes the wallet's stake for the challenge
-/// and returns the curve at the frozen amount (always 1.0x when
-/// `CURVE_UNIT == 0`), but nothing is gated yet (S5) and no mint lock is
-/// taken (S6). Challenge bookkeeping (`wired`, `retired`,
+/// delay. Matured stake unassigned during the open challenge still counts
+/// for it and is held in the module until the next snapshot (`heldBy`,
+/// `withdrawableOf`), so stake never leaves while it counts.
+/// `powerMultiplierWad` is now the eligibility gate: it freezes the
+/// wallet's stake for the challenge and REVERTS `NotEligible(2)` below
+/// `MIN_STAKE` (unless the failsafe fired), then writes a transient
+/// eligibility note that `onProofAccepted` clears in the same transaction.
+/// The funds check (reason 3) and the per-mint lock settled from the note
+/// land in S6. Challenge bookkeeping (`wired`, `retired`,
 /// `latestChallengeId`, `lastAcceptedProofs`) mirrors `MiningPowerCustody`
 /// exactly so the module is a drop-in for the core.
 contract PrefundedMiningPower is IMiningPower, ReentrancyGuard {
@@ -93,6 +98,7 @@ contract PrefundedMiningPower is IMiningPower, ReentrancyGuard {
     error Insolvency();
     error DebitMismatch();
     error InvalidConfiguration();
+    error StakeHeldUntilNextChallenge(uint256 held, uint256 epoch);
 
     event Deposited(address indexed depositor, uint256 amount);
     event Assigned(address indexed depositor, address indexed miningWallet, uint256 amount, uint256 timestamp);
@@ -111,6 +117,16 @@ contract PrefundedMiningPower is IMiningPower, ReentrancyGuard {
     uint256 private constant _WAD = 1e18;
     uint256 private constant _SLOPE_WAD = 5e17; // 0.5
     uint256 private constant _CAP_BONUS_WAD = 2e18; // bonus cap → max multiplier 3x
+
+    /// @dev Transient slot holding `uint256(keccak256(abi.encode(challengeId,
+    /// miner)))` for the proof the gate just admitted. Written only by an
+    /// enforcing gate, cleared by `onProofAccepted` in the same transaction;
+    /// a reverted submission rolls it back with the rest of the frame.
+    uint256 private constant _ELIGIBLE_NOTE_SLOT = uint256(keccak256("proof-hunters.PrefundedMiningPower.eligible.v1"));
+    /// @dev Transient slot holding the admitted miner (S6 recovers the lock
+    /// owner from it, since `onProofAccepted` carries no miner argument).
+    uint256 private constant _ELIGIBLE_MINER_SLOT =
+        uint256(keccak256("proof-hunters.PrefundedMiningPower.eligible.miner.v1"));
 
     /// @notice The HUNTER token staked, funded and committed here.
     IERC20 public immutable HUNTER;
@@ -177,6 +193,19 @@ contract PrefundedMiningPower is IMiningPower, ReentrancyGuard {
     /// open challenge. Added back at that challenge's freeze so removals only
     /// take effect from the next one — the bind holds for exits as for entries.
     mapping(address => uint256) public removingOf;
+    /// @notice Matured stake this depositor unassigned during `heldEpochBy`.
+    /// It still counts for that challenge (via the wallet's `removingOf`), so
+    /// it may not leave the module until the next snapshot opens: `withdraw`
+    /// is limited to `withdrawableOf`. Never reduced by a re-assign — held
+    /// stake moved to another wallet (pending there) and unassigned again in
+    /// the same epoch must still stay in the module.
+    mapping(address => uint256) public heldBy;
+    /// @notice Challenge the depositor's `heldBy` amount belongs to.
+    mapping(address => uint256) public heldEpochBy;
+    /// @notice Latest challenge during which a detach waived the hold (0 =
+    /// none). Removals queued in that epoch may already have been withdrawn,
+    /// so they no longer count if the module is re-wired into it.
+    uint256 public holdWaivedEpoch;
 
     mapping(uint256 => bool) private _challengeOpen;
     mapping(uint256 => mapping(address => bool)) private _frozen;
@@ -213,11 +242,34 @@ contract PrefundedMiningPower is IMiningPower, ReentrancyGuard {
     // ------------------------------------------------------------------
 
     /// @inheritdoc IMiningPower
-    /// @dev Freezes `miner`'s stake for `challengeId` on first read and
-    /// returns the curve at the frozen amount (1.0x when `CURVE_UNIT == 0`).
-    /// S4: no eligibility gate yet — that lands in S5.
+    /// @notice Eligibility gate. The core calls this BEFORE its digest check.
+    /// @dev Freezes `miner`'s stake for `challengeId` (stake assigned after the
+    /// challenge opened does not count; matured stake unassigned after it
+    /// opened still does) and, unless the failsafe fired, reverts
+    /// `NotEligible(2)` when the frozen stake is below `MIN_STAKE`.
+    /// Ineligibility MUST be a revert: in this core a zero or below-base
+    /// multiplier is NOT a ban — `_effectiveTarget` treats anything
+    /// `<= POWER_BASE_WAD` as the plain base target, so returning 0 would still
+    /// let an unqualified wallet mint at the base difficulty.
+    /// On success an enforcing gate records a transient note (challenge,
+    /// miner) that `onProofAccepted` consumes and clears in the same
+    /// transaction. With `gateDisabled` no check runs and NO note is written,
+    /// so from S6 on no mint lock is taken either (mining is free again).
+    /// Returns the curve at the frozen amount (1.0x when `CURVE_UNIT == 0`).
     function powerMultiplierWad(uint256 challengeId, address miner) external onlyMiningCore returns (uint256) {
-        return multiplierFromLockedAmount(_freeze(challengeId, miner));
+        uint256 frozen = _freeze(challengeId, miner);
+        if (!gateDisabled) {
+            if (frozen < MIN_STAKE) revert NotEligible(2);
+            // S6 hook point: funds check — revert NotEligible(3) below LOCK_PER_MINT.
+            uint256 note = uint256(keccak256(abi.encode(challengeId, miner)));
+            uint256 noteSlot = _ELIGIBLE_NOTE_SLOT;
+            uint256 minerSlot = _ELIGIBLE_MINER_SLOT;
+            assembly ("memory-safe") {
+                tstore(noteSlot, note)
+                tstore(minerSlot, miner)
+            }
+        }
+        return multiplierFromLockedAmount(frozen);
     }
 
     /// @inheritdoc IMiningPower
@@ -246,17 +298,32 @@ contract PrefundedMiningPower is IMiningPower, ReentrancyGuard {
     }
 
     /// @inheritdoc IMiningPower
+    /// @dev Always clears the transient eligibility note so it can never
+    /// outlive the acceptance it was written for (the core fires this hook
+    /// after its counters update and before the NFT mint; it also fires on
+    /// attach, when no note exists and clearing is a no-op).
     function onProofAccepted(uint256 acceptedProofs) external onlyMiningCore {
         lastAcceptedProofs = acceptedProofs;
         emit ProofProgress(acceptedProofs);
+        // S6 hook point: settle the per-mint lock from the note here, before it is cleared.
+        uint256 noteSlot = _ELIGIBLE_NOTE_SLOT;
+        uint256 minerSlot = _ELIGIBLE_MINER_SLOT;
+        assembly ("memory-safe") {
+            tstore(noteSlot, 0)
+            tstore(minerSlot, 0)
+        }
     }
 
     /// @inheritdoc IMiningPower
     /// @dev Retirement is sticky until a later rewire (`snapshotChallenge`
     /// clears it); a non-terminal detach never un-retires the module.
+    /// Any detach waives the stake hold (see `withdrawableOf`) — otherwise a
+    /// module that is never re-wired would hold that stake forever — so the
+    /// removals queued in the open epoch stop counting (`holdWaivedEpoch`).
     function onMiningPowerDetached(bool terminal) external onlyMiningCore {
         wired = false;
         retired = retired || terminal;
+        holdWaivedEpoch = latestChallengeId;
     }
 
     // ------------------------------------------------------------------
@@ -319,7 +386,9 @@ contract PrefundedMiningPower is IMiningPower, ReentrancyGuard {
     /// fired. The cooldown is wall-clock only and never reads proof counts,
     /// so a detached module's stake always becomes exitable. The caller's own
     /// still-pending share leaves first; the matured remainder is queued in
-    /// `removingOf` so it only narrows the NEXT challenge's freeze.
+    /// `removingOf` so it only narrows the NEXT challenge's freeze, and is
+    /// held in the module (`heldBy`) until that challenge opens: stake that
+    /// still counts can never leave while it counts.
     /// Fails closed (`Insolvency`) when the books no longer cover the balance.
     function unassign(address miningWallet, uint256 amount) external nonReentrant {
         if (miningWallet == address(0)) revert ZeroAddress();
@@ -337,6 +406,7 @@ contract PrefundedMiningPower is IMiningPower, ReentrancyGuard {
         pendingBy[msg.sender] -= pendingPart;
         pendingOf[miningWallet] -= pendingPart;
         removingOf[miningWallet] += amount - pendingPart;
+        heldBy[msg.sender] += amount - pendingPart;
         assignedBy[msg.sender] = available - amount;
         assignedOf[miningWallet] -= amount;
         totalAssigned -= amount;
@@ -345,13 +415,21 @@ contract PrefundedMiningPower is IMiningPower, ReentrancyGuard {
         emit Unassigned(msg.sender, miningWallet, amount, block.timestamp);
     }
 
-    /// @notice Withdraw unassigned stake. Allowed in every state.
-    /// @dev The module's balance must drop by exactly `amount`
+    /// @notice Withdraw unassigned stake. Allowed in every state, but only
+    /// up to `withdrawableOf(msg.sender)`: matured stake unassigned during the
+    /// open challenge still counts for it and stays until the next snapshot.
+    /// @dev Reverts `InsufficientUnassigned` above the unassigned balance and
+    /// `StakeHeldUntilNextChallenge(held, epoch)` when only the hold blocks it.
+    /// The module's balance must drop by exactly `amount`
     /// (`DebitMismatch` otherwise) and stay solvent before and after.
     function withdraw(uint256 amount) external nonReentrant {
         if (amount == 0) revert ZeroAmount();
         uint256 available = unassignedOf[msg.sender];
         if (amount > available) revert InsufficientUnassigned(available, amount);
+        uint256 held = heldStakeOf(msg.sender);
+        if (amount > available - Math.min(held, available)) {
+            revert StakeHeldUntilNextChallenge(held, latestChallengeId);
+        }
         uint256 beforeBal = _requireSolvent();
         unassignedOf[msg.sender] = available - amount;
         totalStake -= amount;
@@ -365,6 +443,64 @@ contract PrefundedMiningPower is IMiningPower, ReentrancyGuard {
     // ------------------------------------------------------------------
     // Views
     // ------------------------------------------------------------------
+
+    /// @notice What the gate would decide for `wallet` in the current
+    /// (latest snapshotted) challenge, without freezing anything.
+    /// @dev `stake` is exactly what `_freeze` would record (or has recorded)
+    /// for `latestChallengeId`. `funds` is 0 until S6. Reason codes: 0 ok,
+    /// 1 this module is not the live one (not wired, or retired),
+    /// 2 stake below `MIN_STAKE`, 3 (S6) funds below `LOCK_PER_MINT`.
+    /// Once the failsafe fired a wired module reports eligible (reason 0).
+    function eligibilityOf(address wallet)
+        external
+        view
+        returns (bool eligible, uint8 reason, uint256 stake, uint256 funds)
+    {
+        stake = _frozenPreview(wallet);
+        if (!wired || retired) return (false, 1, stake, funds);
+        if (gateDisabled) return (true, 0, stake, funds);
+        if (stake < MIN_STAKE) return (false, 2, stake, funds);
+        // S6 hook point: funds check — reason 3 below LOCK_PER_MINT.
+        return (true, 0, stake, funds);
+    }
+
+    /// @notice The multiplier the gate would return for `wallet` in the
+    /// current challenge (it does not say whether the gate would admit it —
+    /// use `eligibilityOf`).
+    function previewSubmit(address wallet) external view returns (uint256 multiplierWad) {
+        return multiplierFromLockedAmount(_frozenPreview(wallet));
+    }
+
+    /// @notice Matured stake `depositor` unassigned during the open challenge
+    /// that must stay in the module until the next snapshot. Zero once the
+    /// module is not wired, is retired, or the failsafe fired (the hold is
+    /// waived exactly like the exit cooldown, plus on any detach, and stays
+    /// waived for the rest of that epoch after a re-wire into it — its
+    /// removals no longer count, see `holdWaivedEpoch`). May exceed
+    /// `unassignedOf` while held stake is re-assigned (pending) elsewhere.
+    function heldStakeOf(address depositor) public view returns (uint256) {
+        uint256 latest = latestChallengeId;
+        if (!wired || retired || gateDisabled || latest == holdWaivedEpoch) return 0;
+        return heldEpochBy[depositor] == latest ? heldBy[depositor] : 0;
+    }
+
+    /// @notice Unassigned stake `depositor` may withdraw right now.
+    function withdrawableOf(address depositor) external view returns (uint256) {
+        uint256 unassigned = unassignedOf[depositor];
+        return unassigned - Math.min(heldStakeOf(depositor), unassigned);
+    }
+
+    /// @notice The transient eligibility note of the current transaction
+    /// (zero outside a submission). Diagnostic only; it must always read
+    /// (0, address(0)) once a proof has been accepted.
+    function pendingEligibleNote() external view returns (uint256 note, address miner) {
+        uint256 noteSlot = _ELIGIBLE_NOTE_SLOT;
+        uint256 minerSlot = _ELIGIBLE_MINER_SLOT;
+        assembly ("memory-safe") {
+            note := tload(noteSlot)
+            miner := tload(minerSlot)
+        }
+    }
 
     /// @notice The old custody's power curve: 1 + 0.5 * log2(locked / CURVE_UNIT + 1),
     /// bonus capped at 2x (max 3x). Always 1.0x when the bonus is disabled.
@@ -396,6 +532,10 @@ contract PrefundedMiningPower is IMiningPower, ReentrancyGuard {
             pendingBy[msg.sender] = 0;
             pendingEpochBy[msg.sender] = latest;
         }
+        if (heldEpochBy[msg.sender] < latest) {
+            heldBy[msg.sender] = 0;
+            heldEpochBy[msg.sender] = latest;
+        }
     }
 
     /// @dev Lazy per-wallet freeze, identical to `MiningPowerCustody._freeze`.
@@ -410,12 +550,30 @@ contract PrefundedMiningPower is IMiningPower, ReentrancyGuard {
         // epoch — older balances are no longer derivable once buckets settle,
         // so refuse rather than permanently record a wrong snapshot.
         if (challengeId != latestChallengeId) revert StaleChallengeId(challengeId, latestChallengeId);
-        frozen = assignedOf[miningWallet];
-        if (pendingEpoch[miningWallet] == challengeId) {
-            frozen = frozen - pendingOf[miningWallet] + removingOf[miningWallet];
-        }
+        frozen = _maturedStake(challengeId, miningWallet);
         _frozenStake[challengeId][miningWallet] = frozen;
         _frozen[challengeId][miningWallet] = true;
+    }
+
+    /// @dev Read-only twin of `_freeze` for `latestChallengeId`: the recorded
+    /// value if the wallet was already frozen, else what `_freeze` would record.
+    function _frozenPreview(address miningWallet) private view returns (uint256) {
+        uint256 challengeId = latestChallengeId;
+        if (_frozen[challengeId][miningWallet]) return _frozenStake[challengeId][miningWallet];
+        return _maturedStake(challengeId, miningWallet);
+    }
+
+    /// @dev Stake matured for `challengeId` (the latest epoch): assigns made
+    /// after it opened are excluded, matured removals made after it opened
+    /// are added back — unless a detach waived their hold in this epoch, in
+    /// which case they may have left the module and never count again.
+    /// Shared by `_freeze` and `_frozenPreview`.
+    function _maturedStake(uint256 challengeId, address miningWallet) private view returns (uint256 matured) {
+        matured = assignedOf[miningWallet];
+        if (pendingEpoch[miningWallet] == challengeId) {
+            matured -= pendingOf[miningWallet];
+            if (challengeId != holdWaivedEpoch) matured += removingOf[miningWallet];
+        }
     }
 
     /// @dev Fails closed when the recorded obligations exceed the balance —

@@ -22,6 +22,7 @@ contract PrefundedMiningPowerLedgerTest is PrefundedMiningStack {
 
     uint256 private constant LOCK = 100e18;
     uint256 private constant COOLDOWN = 1 hours;
+    uint256 private constant GATED_MIN = 1_000e18;
 
     function setUp() public override {
         super.setUp();
@@ -541,6 +542,213 @@ contract PrefundedMiningPowerLedgerTest is PrefundedMiningStack {
     }
 
     // ------------------------------------------------------------------
+    // Stake hold: matured stake unassigned mid-challenge stays until the
+    // next snapshot (it still counts for the open challenge).
+    // ------------------------------------------------------------------
+
+    /// @dev The cooldown has elapsed, yet the stake that still backs MINER
+    /// in the open challenge cannot leave; MINER mines a real proof with it,
+    /// and only once the next challenge opens is it withdrawable — and MINER
+    /// is then no longer eligible.
+    function testMaturedUnassignHeldUntilNextSnapshot() public {
+        _useGatedModule();
+        _qualify(ALICE, MINER, GATED_MIN);
+        uint256 c = cid;
+        vm.warp(block.timestamp + COOLDOWN);
+        _unassign(ALICE, MINER, GATED_MIN);
+        assertEq(module.unassignedOf(ALICE), GATED_MIN);
+        assertEq(module.heldBy(ALICE), GATED_MIN);
+        assertEq(module.heldEpochBy(ALICE), c);
+        assertEq(module.heldStakeOf(ALICE), GATED_MIN);
+        assertEq(module.withdrawableOf(ALICE), 0);
+        assertEq(module.removingOf(MINER), GATED_MIN);
+        _assertBooks();
+
+        vm.prank(ALICE);
+        vm.expectRevert(abi.encodeWithSelector(PrefundedMiningPower.StakeHeldUntilNextChallenge.selector, GATED_MIN, c));
+        module.withdraw(1);
+        // Over the unassigned balance it is still the plain balance error.
+        vm.prank(ALICE);
+        vm.expectRevert(
+            abi.encodeWithSelector(PrefundedMiningPower.InsufficientUnassigned.selector, GATED_MIN, GATED_MIN + 1)
+        );
+        module.withdraw(GATED_MIN + 1);
+
+        // The held stake still backs MINER this challenge: a real proof mints.
+        (bool eligible,, uint256 stake,) = module.eligibilityOf(MINER);
+        assertTrue(eligible);
+        assertEq(stake, GATED_MIN);
+        uint256 tokenId = _win(MINER);
+        assertEq(nft.ownerOf(tokenId), MINER);
+
+        // Next challenge: the hold is gone and so is MINER's eligibility.
+        _activate();
+        assertEq(cid, c + 1);
+        assertEq(module.heldStakeOf(ALICE), 0);
+        assertEq(module.withdrawableOf(ALICE), GATED_MIN);
+        uint8 reason;
+        (eligible, reason, stake,) = module.eligibilityOf(MINER);
+        assertFalse(eligible);
+        assertEq(reason, 2);
+        assertEq(stake, 0);
+        (uint256 n,) = _nonce(MINER);
+        _expectNotEligible(2);
+        _send(MINER, n);
+        _withdraw(ALICE, GATED_MIN);
+        assertEq(token.balanceOf(ALICE), GATED_MIN);
+        _assertBooks();
+    }
+
+    /// @dev Stake assigned in the open challenge never counted, so it is not
+    /// held; in a mixed exit only the matured part is held.
+    function testPendingUnassignIsImmediatelyWithdrawable() public {
+        uint256 c = core.activeChallengeId();
+        _deposit(ALICE, 1_000e18);
+        _assign(ALICE, MINER, 1_000e18);
+        vm.warp(block.timestamp + COOLDOWN);
+        _unassign(ALICE, MINER, 1_000e18);
+        assertEq(module.heldBy(ALICE), 0);
+        assertEq(module.withdrawableOf(ALICE), 1_000e18);
+        _withdraw(ALICE, 1_000e18);
+        assertEq(core.activeChallengeId(), c);
+        _assertBooks();
+
+        // Mixed: 600 matured + 400 pending top-up, all unassigned.
+        _qualify(BOB, MINER2, 600e18);
+        _deposit(BOB, 400e18);
+        _assign(BOB, MINER2, 400e18);
+        vm.warp(block.timestamp + COOLDOWN);
+        _unassign(BOB, MINER2, 1_000e18);
+        assertEq(module.heldStakeOf(BOB), 600e18);
+        assertEq(module.withdrawableOf(BOB), 400e18);
+        vm.prank(BOB);
+        vm.expectRevert(abi.encodeWithSelector(PrefundedMiningPower.StakeHeldUntilNextChallenge.selector, 600e18, cid));
+        module.withdraw(400e18 + 1);
+        _withdraw(BOB, 400e18);
+        assertEq(module.unassignedOf(BOB), 600e18);
+        _assertBooks();
+
+        // The refresh path (no proof) releases it as well.
+        _nextChallenge();
+        assertEq(module.withdrawableOf(BOB), 600e18);
+        _withdraw(BOB, 600e18);
+        assertEq(token.balanceOf(BOB), 1_000e18);
+        _assertBooks();
+    }
+
+    /// @dev Waived exactly like the cooldown: failsafe, then retirement.
+    function testHoldWaivedAfterRetirementAndFailsafe() public {
+        // Failsafe (S8 lands `disableRequirement`; injected with stdstore).
+        _useGatedModule();
+        _qualify(ALICE, MINER, GATED_MIN);
+        vm.warp(block.timestamp + COOLDOWN);
+        _unassign(ALICE, MINER, GATED_MIN);
+        assertEq(module.withdrawableOf(ALICE), 0);
+        stdstore.enable_packed_slots().target(address(module)).sig("gateDisabled()").checked_write(true);
+        assertEq(module.heldStakeOf(ALICE), 0);
+        assertEq(module.withdrawableOf(ALICE), GATED_MIN);
+        _withdraw(ALICE, GATED_MIN);
+        _assertBooks();
+
+        // Retirement (terminal stop) on a fresh gated module.
+        _useGatedModule();
+        _qualify(BOB, MINER2, GATED_MIN);
+        vm.warp(block.timestamp + COOLDOWN);
+        _unassign(BOB, MINER2, GATED_MIN);
+        assertEq(module.withdrawableOf(BOB), 0);
+        vm.prank(STOP);
+        core.stopMining();
+        assertTrue(module.retired());
+        assertEq(module.heldStakeOf(BOB), 0);
+        _withdraw(BOB, GATED_MIN);
+        assertEq(token.balanceOf(BOB), GATED_MIN);
+        _assertBooks();
+    }
+
+    /// @dev A non-terminal detach also waives the hold (a module that is
+    /// never re-wired would otherwise keep the stake forever). The released
+    /// removal then no longer counts if the module is re-wired into the same
+    /// challenge, so it can never back a wallet with nothing in the module.
+    function testDetachWaivesHoldAndRewiredEpochIgnoresReleasedRemoval() public {
+        _useGatedModule();
+        _qualify(ALICE, MINER, GATED_MIN);
+        uint256 c = cid;
+        vm.warp(block.timestamp + COOLDOWN);
+        _unassign(ALICE, MINER, GATED_MIN);
+        assertEq(module.withdrawableOf(ALICE), 0);
+
+        _detach();
+        assertEq(module.holdWaivedEpoch(), c);
+        assertEq(module.heldStakeOf(ALICE), 0);
+        _withdraw(ALICE, GATED_MIN);
+        assertEq(token.balanceOf(address(module)), 0);
+
+        // Re-wired into the SAME challenge: MINER's queued removal is void.
+        _attach(module);
+        assertEq(module.latestChallengeId(), c);
+        assertEq(module.removingOf(MINER), GATED_MIN);
+        (bool eligible, uint8 reason, uint256 stake,) = module.eligibilityOf(MINER);
+        assertFalse(eligible);
+        assertEq(reason, 2);
+        assertEq(stake, 0);
+        _activate();
+        (uint256 n,) = _nonce(MINER);
+        _expectNotEligible(2);
+        _send(MINER, n);
+        _assertBooks();
+    }
+
+    /// @dev Held stake re-assigned to W2 mid-challenge is pending there: W2
+    /// is frozen at 0 and W1 keeps its frozen stake — one challenge, one
+    /// wallet. Bouncing it back out of W2 (a pending-part unassign) does not
+    /// release the hold. Next challenge W2 counts and W1 does not.
+    function testHeldStakeCannotCountTwiceInOneChallenge() public {
+        _useGatedModule();
+        _qualify(ALICE, MINER, GATED_MIN);
+        uint256 c = cid;
+        vm.warp(block.timestamp + COOLDOWN);
+        _unassign(ALICE, MINER, GATED_MIN);
+        _assign(ALICE, MINER2, GATED_MIN);
+        assertEq(module.unassignedOf(ALICE), 0);
+        assertEq(module.heldStakeOf(ALICE), GATED_MIN);
+        assertEq(module.withdrawableOf(ALICE), 0);
+        _assertStake(MINER, true, GATED_MIN);
+        _assertStake(MINER2, false, 0);
+        _assertBooks();
+
+        // Laundering attempt: pull it back out of W2 (pending part) — still held.
+        vm.warp(block.timestamp + COOLDOWN);
+        _unassign(ALICE, MINER2, GATED_MIN);
+        assertEq(module.removingOf(MINER2), 0);
+        assertEq(module.unassignedOf(ALICE), GATED_MIN);
+        vm.prank(ALICE);
+        vm.expectRevert(abi.encodeWithSelector(PrefundedMiningPower.StakeHeldUntilNextChallenge.selector, GATED_MIN, c));
+        module.withdraw(1);
+        _assign(ALICE, MINER2, GATED_MIN);
+        _assertStake(MINER, true, GATED_MIN);
+        _assertStake(MINER2, false, 0);
+        _assertBooks();
+
+        // Real core: W2 rejected, W1 mines.
+        (uint256 n,) = _nonce(MINER2);
+        _expectNotEligible(2);
+        _send(MINER2, n);
+        _win(MINER);
+
+        // Next challenge: W2 counts, W1 does not.
+        _activate();
+        assertEq(cid, c + 1);
+        _assertStake(MINER, false, 0);
+        _assertStake(MINER2, true, GATED_MIN);
+        (n,) = _nonce(MINER);
+        _expectNotEligible(2);
+        _send(MINER, n);
+        _win(MINER2);
+        assertEq(module.heldStakeOf(ALICE), 0);
+        _assertBooks();
+    }
+
+    // ------------------------------------------------------------------
     // Fuzz: random sequences conserve every unit
     // ------------------------------------------------------------------
 
@@ -588,11 +796,26 @@ contract PrefundedMiningPowerLedgerTest is PrefundedMiningStack {
                     }
                 }
             } else if (op == 3) {
+                // Withdraw within `withdrawableOf`; any excess over it that
+                // is still unassigned must be held stake and revert.
                 uint256 avail = module.unassignedOf(d);
-                if (avail != 0) {
-                    uint256 a = (amt % avail) + 1;
+                uint256 free = module.withdrawableOf(d);
+                if (free != 0) {
+                    uint256 a = (amt % free) + 1;
                     _withdraw(d, a);
                     outflow[di] += a;
+                }
+                free = module.withdrawableOf(d);
+                avail = module.unassignedOf(d);
+                if (avail > free) {
+                    bytes memory heldErr = abi.encodeWithSelector(
+                        PrefundedMiningPower.StakeHeldUntilNextChallenge.selector,
+                        module.heldStakeOf(d),
+                        module.latestChallengeId()
+                    );
+                    vm.prank(d);
+                    vm.expectRevert(heldErr);
+                    module.withdraw(free + 1);
                 }
             } else if (op == 4) {
                 vm.warp(block.timestamp + ((r >> 128) % (2 * COOLDOWN)));
@@ -615,6 +838,7 @@ contract PrefundedMiningPowerLedgerTest is PrefundedMiningStack {
             uint256 assigned = module.assignedBy(d);
             if (assigned != 0) _unassign(d, module.assigneeOf(d), assigned);
             uint256 avail = module.unassignedOf(d);
+            assertEq(module.withdrawableOf(d), avail, "hold not waived after retirement");
             if (avail != 0) {
                 _withdraw(d, avail);
                 outflow[k] += avail;
@@ -633,6 +857,19 @@ contract PrefundedMiningPowerLedgerTest is PrefundedMiningStack {
     // ------------------------------------------------------------------
     // Helpers
     // ------------------------------------------------------------------
+
+    /// @dev Swap the attached module for one that enforces `GATED_MIN`.
+    function _useGatedModule() private {
+        _detach();
+        _deployModule(GATED_MIN, LOCK, COOLDOWN, 0, address(0));
+        _attach(module);
+    }
+
+    function _assertStake(address wallet, bool eligible, uint256 stake) private view {
+        (bool e,, uint256 s,) = module.eligibilityOf(wallet);
+        assertEq(e, eligible, "eligible");
+        assertEq(s, stake, "frozen stake");
+    }
 
     /// @dev Swap the attached base module for a curve-enabled one.
     function _useCurvedModule() private {

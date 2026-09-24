@@ -296,13 +296,41 @@ abstract contract PrefundedMiningStack is Test {
         module.withdraw(amt);
     }
 
+    /// @dev Opens the next challenge WITHOUT an accepted proof: rolls past the
+    /// active seed's readable window and calls the permissionless
+    /// `core.refreshExpiredSeed()`, which snapshots the new challenge on the
+    /// attached module. Call `_activate()` afterwards to mine in it.
+    function _nextChallenge() internal {
+        uint256 expiry = core.activeSeedParentBlock() + core.SEED_READABLE_PARENT_BLOCKS() + 1;
+        if (block.number < expiry) vm.roll(expiry);
+        core.refreshExpiredSeed();
+    }
+
+    /// @dev `depositor` deposits `stake` and assigns it to `wallet`; the next
+    /// challenge is then opened (via `_nextChallenge`, so no pre-existing
+    /// eligible miner is needed) and activated, so the stake has matured and
+    /// `wallet` can mine immediately. The module must be attached.
+    function _qualify(address depositor, address wallet, uint256 stake) internal {
+        _deposit(depositor, stake);
+        _assign(depositor, wallet, stake);
+        _nextChallenge();
+        _activate();
+    }
+
+    /// @dev Expects the next call to revert with the gate's `NotEligible(reason)`.
+    function _expectNotEligible(uint8 reason) internal {
+        vm.expectRevert(abi.encodeWithSelector(PrefundedMiningPower.NotEligible.selector, reason));
+    }
+
     /// @dev Harness token books. The old custody holds exactly its recorded
     /// stake and never assigns more than it holds. When a Prefunded `module`
     /// is deployed it must hold at least its obligations, and the tracked
     /// accounts must reproduce its totals exactly (every depositor's
     /// unassigned + assigned stake sums to `totalStake`; every wallet's
     /// assigned stake sums to `totalAssigned` and equals the sum of its
-    /// backers' `assignedBy`). Only exact while all ledger calls go through
+    /// backers' `assignedBy`; a depositor's held stake never exceeds what
+    /// it still has in the module and `withdrawableOf` is exactly the unheld
+    /// unassigned part). Only exact while all ledger calls go through
     /// the tracking helpers (or `_trackDepositor` / `_trackWallet`).
     function _assertBooks() internal view virtual {
         assertEq(token.balanceOf(address(oldCustody)), oldCustody.totalLocked(), "old custody books");
@@ -321,6 +349,16 @@ abstract contract PrefundedMiningStack is Test {
             address d = trackedDepositors[i];
             stakeSum += module.unassignedOf(d) + module.assignedBy(d);
             assertLe(module.pendingBy(d), module.assignedBy(d), "pendingBy > assignedBy");
+            // Held stake is always still in the module (unassigned, or
+            // re-assigned as pending elsewhere); only the unheld part leaves.
+            uint256 held = module.heldStakeOf(d);
+            assertLe(held, module.unassignedOf(d) + module.assignedBy(d), "held stake left the module");
+            assertLe(module.withdrawableOf(d), module.unassignedOf(d), "withdrawable > unassigned");
+            assertEq(
+                module.withdrawableOf(d),
+                module.unassignedOf(d) - (held < module.unassignedOf(d) ? held : module.unassignedOf(d)),
+                "withdrawable != unassigned - held"
+            );
             if (module.assignedBy(d) == 0) assertEq(module.assigneeOf(d), address(0), "dangling assignee");
             else assertTrue(module.assigneeOf(d) != address(0), "assigned without assignee");
         }
