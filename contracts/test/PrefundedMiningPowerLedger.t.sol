@@ -12,13 +12,18 @@ import {PrefundedBonusHunter} from "./PrefundedMiningPowerHostile.t.sol";
 /// @notice S4 (VLT-55) stake ledger of PrefundedMiningPower on the REAL stack.
 /// Every hook call comes from the real `HunterMiningCore` (attach, submitProof,
 /// stopMining); frozen stake is observed through the effective target the
-/// core applies to a real proof. All amounts are TEST-ONLY fixture values.
+/// core applies to a real proof. Single bucket (owner decision 2026-09-25):
+/// every win takes `LOCK` from the winner's assigned stake, a wallet has one
+/// backer, and the modules here use the smallest legal floor
+/// (MIN_STAKE == LOCK) unless gated. OUTSIDER mines on stake backed by
+/// OUTSIDER_BACKER. All amounts are TEST-ONLY fixture values.
 contract PrefundedMiningPowerLedgerTest is PrefundedMiningStack {
     using stdStorage for StdStorage;
 
     address internal constant CAROL = address(0xCA201);
     address internal constant MINER2 = address(0x222E);
     address internal constant OUTSIDER = address(0x0B5E);
+    address internal constant OUTSIDER_BACKER = address(0x0B5B);
 
     uint256 private constant LOCK = 100e18;
     uint256 private constant COOLDOWN = 1 hours;
@@ -26,7 +31,7 @@ contract PrefundedMiningPowerLedgerTest is PrefundedMiningStack {
 
     function setUp() public override {
         super.setUp();
-        _deployModule(0, LOCK, COOLDOWN, 0, address(0));
+        _deployModule(LOCK, LOCK, COOLDOWN, 0, address(0));
         _attach(module);
         assertTrue(module.wired());
     }
@@ -112,16 +117,20 @@ contract PrefundedMiningPowerLedgerTest is PrefundedMiningStack {
     // Challenge bind (curve enabled, observed through the real core)
     // ------------------------------------------------------------------
 
-    /// @dev Stake assigned during challenge c1 is pending (1.0x in c1). It
-    /// matures into c2; unassigned mid-c2 it is queued in `removingOf`, so the
-    /// real core still applies MINER's 2.0x multiplier in c2 (3,000 frozen;
-    /// the widened target saturates at MAX_TARGET). From
-    /// c3 on it is gone and the same band is rejected at the base target.
+    /// @dev Stake assigned during challenge c1 is pending (1.0x in c1 on a
+    /// one-lock matured base). It matures into c2; mostly unassigned mid-c2
+    /// it is queued in `removingOf`, so the real core still applies MINER's
+    /// 2.0x multiplier in c2 (3,000 + L frozen; the widened target saturates
+    /// at MAX_TARGET) and the win's lock comes out of the 2L still assigned.
+    /// From c3 on the removal is gone (L left, 1.0x) and the same band is
+    /// rejected at the base target.
     function testUnassignRemovalAppliesNextChallenge() public {
         _useCurvedModule();
+        _deposit(ALICE, 3_000e18 + LOCK);
+        _assign(ALICE, MINER, LOCK);
+        _nextChallenge(); // the one-lock base matures: MINER passes the floor
         _activate();
         uint256 c1 = cid;
-        _deposit(ALICE, 3_000e18);
         _assign(ALICE, MINER, 3_000e18);
         assertEq(module.pendingOf(MINER), 3_000e18);
         assertEq(module.pendingEpoch(MINER), c1);
@@ -133,23 +142,23 @@ contract PrefundedMiningPowerLedgerTest is PrefundedMiningStack {
         vm.expectRevert(abi.encodeWithSelector(HunterMiningCore.InvalidProof.selector, d, base));
         core.submitProof(cid, seed, n, basket);
 
-        // c2 opens; ALICE's 3,000 matured, then exits mid-challenge.
+        // c2 opens; ALICE's 3,000 + L matured, then 3,000 - L exits mid-challenge.
         _win(OUTSIDER);
         _activate();
         uint256 c2 = cid;
         assertEq(c2, c1 + 1);
         assertEq(module.latestChallengeId(), c2);
         vm.warp(block.timestamp + COOLDOWN);
-        _unassign(ALICE, MINER, 3_000e18);
-        assertEq(module.assignedOf(MINER), 0);
+        _unassign(ALICE, MINER, 3_000e18 - LOCK);
+        assertEq(module.assignedOf(MINER), 2 * LOCK);
         assertEq(module.pendingOf(MINER), 0);
-        assertEq(module.removingOf(MINER), 3_000e18);
+        assertEq(module.removingOf(MINER), 3_000e18 - LOCK);
         assertEq(module.pendingEpoch(MINER), c2);
-        assertEq(module.totalAssigned(), 0);
+        assertEq(module.totalAssigned(), 2 * LOCK + module.assignedOf(OUTSIDER));
         _assertBooks();
 
-        // c2: the removal has not landed yet — 3,000 frozen → 2.0x (saturated).
-        assertEq(module.multiplierFromLockedAmount(3_000e18), 2e18);
+        // c2: the removal has not landed yet — 3,000 + L frozen → 2.0x (saturated).
+        assertEq(module.multiplierFromLockedAmount(3_000e18 + LOCK), 2e18);
         base = core.currentTarget();
         uint256 widened = _widen(base, 2e18);
         (n, d) = _bandNonce(MINER, base, widened);
@@ -159,6 +168,7 @@ contract PrefundedMiningPowerLedgerTest is PrefundedMiningStack {
         assertEq(nft.ownerOf(before + 1), MINER);
         (,,, uint8 tier) = nft.birthData(before + 1);
         assertEq(tier, 1); // bonus-band proof mints one common NFT
+        assertEq(module.assignedOf(MINER), LOCK); // the lock took L of the live 2L
 
         // c3: the removal landed — the same band is rejected at the base target.
         _activate();
@@ -171,18 +181,19 @@ contract PrefundedMiningPowerLedgerTest is PrefundedMiningStack {
         // The stale c2 bucket no longer applies (epoch is behind).
         assertLt(module.pendingEpoch(MINER), module.latestChallengeId());
 
-        _withdraw(ALICE, 3_000e18);
-        assertEq(token.balanceOf(ALICE), 3_000e18);
+        _withdraw(ALICE, 3_000e18 - LOCK);
+        assertEq(token.balanceOf(ALICE), 3_000e18 - LOCK);
         _assertBooks();
     }
 
-    /// @dev Port of the old custody regression: a matured depositor exiting a
-    /// shared wallet debits only their own share — BOB's post-open (pending)
-    /// assignment stays pending and never passes as matured power. ALICE's
-    /// matured 600 (< CURVE_UNIT, 1.0x) exits during c2 while BOB's 1,000
-    /// (1.5x on its own) is pending: through the real core c2 freezes exactly
-    /// ALICE's opening 600, so a bonus-band digest is rejected at the base
-    /// target; from c3 BOB's matured 1,000 widens the same band.
+    /// @dev Port of the old custody regression, one backer at a time: a
+    /// matured backer exiting a wallet debits only their own share, and the
+    /// next backer's post-open (pending) assignment stays pending and never
+    /// passes as matured power. ALICE's matured 600 (< CURVE_UNIT, 1.0x)
+    /// exits during c2, then BOB backs the freed wallet with 1,000 (1.5x on
+    /// its own), pending: through the real core c2 freezes exactly ALICE's
+    /// opening 600, so a bonus-band digest is rejected at the base target;
+    /// from c3 BOB's matured 1,000 widens the same band and pays the lock.
     function testMaturedUnassignDoesNotLaunderPendingAssignment() public {
         _useCurvedModule();
         _activate();
@@ -194,23 +205,24 @@ contract PrefundedMiningPowerLedgerTest is PrefundedMiningStack {
         _activate();
         uint256 c2 = cid;
         assertEq(c2, c1 + 1);
-        _deposit(BOB, 1_000e18);
-        _assign(BOB, MINER, 1_000e18); // pending for c2
-        assertEq(module.pendingOf(MINER), 1_000e18);
-        assertEq(module.pendingEpoch(MINER), c2);
-        assertEq(module.pendingBy(BOB), 1_000e18);
         // ALICE's c1 share is stale (retagged lazily on her next action).
         assertEq(module.pendingBy(ALICE), 600e18);
         assertEq(module.pendingEpochBy(ALICE), c1);
         vm.warp(block.timestamp + COOLDOWN);
         _unassign(ALICE, MINER, 600e18);
-
-        // ALICE's exit is queued as a matured removal; BOB's pending untouched.
-        assertEq(module.assignedOf(MINER), 1_000e18);
-        assertEq(module.pendingOf(MINER), 1_000e18);
-        assertEq(module.pendingBy(BOB), 1_000e18);
+        assertEq(module.backerOf(MINER), address(0));
         assertEq(module.pendingBy(ALICE), 0);
         assertEq(module.pendingEpochBy(ALICE), c2);
+        assertEq(module.removingOf(MINER), 600e18);
+
+        _deposit(BOB, 1_000e18);
+        _assign(BOB, MINER, 1_000e18); // pending for c2
+        // ALICE's exit is queued as a matured removal; BOB's stake is pending.
+        assertEq(module.backerOf(MINER), BOB);
+        assertEq(module.assignedOf(MINER), 1_000e18);
+        assertEq(module.pendingOf(MINER), 1_000e18);
+        assertEq(module.pendingEpoch(MINER), c2);
+        assertEq(module.pendingBy(BOB), 1_000e18);
         assertEq(module.removingOf(MINER), 600e18);
         _assertBooks();
 
@@ -234,23 +246,35 @@ contract PrefundedMiningPowerLedgerTest is PrefundedMiningStack {
         uint256 before = nft.mintedEver();
         _send(MINER, n);
         assertEq(nft.ownerOf(before + 1), MINER);
+        (,,,, address backer,) = module.committedOf(before + 1);
+        assertEq(backer, BOB);
+        assertEq(module.assignedBy(BOB), 1_000e18 - LOCK);
 
-        // BOB's later exit never underflows the shared buckets.
-        _unassign(BOB, MINER, 1_000e18);
+        // BOB's later exit never underflows the buckets.
+        vm.warp(block.timestamp + COOLDOWN);
+        _unassign(BOB, MINER, 1_000e18 - LOCK);
         assertEq(module.assignedOf(MINER), 0);
-        assertEq(module.totalAssigned(), 0);
+        assertEq(module.totalAssigned(), module.assignedOf(OUTSIDER));
         _assertBooks();
     }
 
+    /// @dev One backer per wallet: BOB cannot join ALICE's wallet
+    /// (`WalletAlreadyBacked`), and no depositor can pull more than their
+    /// own assignment or withdraw another's stake.
     function testTwoDepositorsCannotStealSharedAssignment() public {
         _deposit(ALICE, 1_000e18);
         _assign(ALICE, MINER, 1_000e18);
         _deposit(BOB, 2_000e18);
-        _assign(BOB, MINER, 2_000e18);
+        vm.prank(BOB);
+        vm.expectRevert(abi.encodeWithSelector(PrefundedMiningPower.WalletAlreadyBacked.selector, ALICE));
+        module.assign(MINER, 2_000e18);
+        _assign(BOB, MINER2, 2_000e18);
 
-        assertEq(module.assignedOf(MINER), 3_000e18);
+        assertEq(module.assignedOf(MINER), 1_000e18);
         assertEq(module.assignedBy(ALICE), 1_000e18);
         assertEq(module.assignedBy(BOB), 2_000e18);
+        assertEq(module.backerOf(MINER), ALICE);
+        assertEq(module.backerOf(MINER2), BOB);
         _assertBooks();
 
         vm.warp(block.timestamp + COOLDOWN);
@@ -261,13 +285,18 @@ contract PrefundedMiningPowerLedgerTest is PrefundedMiningStack {
         vm.prank(ALICE);
         vm.expectRevert(abi.encodeWithSelector(PrefundedMiningPower.InsufficientUnassigned.selector, 0, 1));
         module.withdraw(1);
+        // Nor can BOB touch ALICE's wallet.
+        vm.prank(BOB);
+        vm.expectRevert(abi.encodeWithSelector(PrefundedMiningPower.WrongAssignee.selector, MINER2, MINER));
+        module.unassign(MINER, 1);
 
         _unassign(ALICE, MINER, 1_000e18);
-        assertEq(module.assignedOf(MINER), 2_000e18);
+        assertEq(module.assignedOf(MINER), 0);
+        assertEq(module.backerOf(MINER), address(0));
         assertEq(module.assignedBy(ALICE), 0);
         assertEq(module.assignedBy(BOB), 2_000e18);
         assertEq(module.assigneeOf(ALICE), address(0));
-        assertEq(module.assigneeOf(BOB), MINER);
+        assertEq(module.assigneeOf(BOB), MINER2);
         assertEq(module.unassignedOf(ALICE), 1_000e18);
         assertEq(module.unassignedOf(BOB), 0);
         assertEq(module.totalStake(), 3_000e18);
@@ -291,7 +320,7 @@ contract PrefundedMiningPowerLedgerTest is PrefundedMiningStack {
         _deposit(ALICE, 1_000e18);
         _assign(ALICE, MINER, 500e18); // ALICE earliest t0 + 1h
         _deposit(BOB, 1_000e18);
-        _assign(BOB, MINER, 500e18); // BOB earliest t0 + 1h (control)
+        _assign(BOB, MINER2, 500e18); // BOB earliest t0 + 1h (control, own wallet)
 
         vm.warp(t0 + COOLDOWN);
         _assign(ALICE, MINER, 500e18); // top-up: ALICE earliest t0 + 2h
@@ -299,7 +328,7 @@ contract PrefundedMiningPowerLedgerTest is PrefundedMiningStack {
         assertEq(module.assignTimestamp(BOB), t0);
 
         vm.warp(t0 + COOLDOWN + COOLDOWN / 2);
-        _unassign(BOB, MINER, 100e18); // control unlocks
+        _unassign(BOB, MINER2, 100e18); // control unlocks
         vm.prank(ALICE);
         vm.expectRevert(
             abi.encodeWithSelector(
@@ -311,7 +340,8 @@ contract PrefundedMiningPowerLedgerTest is PrefundedMiningStack {
         vm.warp(t0 + 2 * COOLDOWN);
         _unassign(ALICE, MINER, 1_000e18);
         assertEq(module.assigneeOf(ALICE), address(0));
-        assertEq(module.assignedOf(MINER), 400e18);
+        assertEq(module.assignedOf(MINER), 0);
+        assertEq(module.assignedOf(MINER2), 400e18);
         assertEq(module.assignedBy(BOB), 400e18);
         _assertBooks();
     }
@@ -319,9 +349,10 @@ contract PrefundedMiningPowerLedgerTest is PrefundedMiningStack {
     /// @dev The cooldown is wall-clock only: with zero proofs accepted it
     /// unlocks on time, and a burst of real proofs never shortens it.
     function testCooldownIsPerDepositorAndProofIndependent() public {
-        // S6: OUTSIDER's 13 wins each lock LOCK of mint funds; fund it and
-        // let the funds mature (refresh opens a challenge, no proof, no warp).
-        _fund(OUTSIDER, 13 * LOCK);
+        // S6: OUTSIDER's 13 wins each lock LOCK of its backer's stake; stake
+        // exactly 13 wins' worth and let it mature (refresh opens a
+        // challenge, no proof, no warp).
+        _backOutsider(13);
         _nextChallenge();
         assertEq(core.acceptedProofs(), 0);
         assertEq(module.lastAcceptedProofs(), 0);
@@ -391,7 +422,7 @@ contract PrefundedMiningPowerLedgerTest is PrefundedMiningStack {
     function testOverReceiptPolicy() public {
         PrefundedBonusHunter bonus = new PrefundedBonusHunter();
         PrefundedMiningPower m =
-            new PrefundedMiningPower(address(bonus), address(core), 0, LOCK, COOLDOWN, 0, address(0));
+            new PrefundedMiningPower(address(bonus), address(core), LOCK, LOCK, COOLDOWN, 0, address(0));
         bonus.setModule(address(m));
         bonus.mint(ALICE, 1_000e18);
         vm.startPrank(ALICE);
@@ -408,7 +439,7 @@ contract PrefundedMiningPowerLedgerTest is PrefundedMiningStack {
     function testAssignRefusedUnwiredDetachedRetiredAndAllowedWhenWired() public {
         // Fresh, never-attached module: deposits land, assigns do not.
         _detach();
-        _deployModule(0, LOCK, COOLDOWN, 0, address(0));
+        _deployModule(LOCK, LOCK, COOLDOWN, 0, address(0));
         assertFalse(module.wired());
         _deposit(ALICE, 1_000e18);
         vm.prank(ALICE);
@@ -551,12 +582,14 @@ contract PrefundedMiningPowerLedgerTest is PrefundedMiningStack {
     // ------------------------------------------------------------------
 
     /// @dev The cooldown has elapsed, yet the stake that still backs MINER
-    /// in the open challenge cannot leave; MINER mines a real proof with it,
-    /// and only once the next challenge opens is it withdrawable — and MINER
-    /// is then no longer eligible.
+    /// in the open challenge cannot leave; MINER mines a real proof with it
+    /// (the lock is paid from the one lock's worth still assigned — held
+    /// stake is unassigned and never locked), and only once the next
+    /// challenge opens is it withdrawable — and MINER is then no longer
+    /// eligible.
     function testMaturedUnassignHeldUntilNextSnapshot() public {
         _useGatedModule();
-        _qualifyAndFund(ALICE, MINER, GATED_MIN, LOCK);
+        _qualify(ALICE, MINER, GATED_MIN + LOCK);
         uint256 c = cid;
         vm.warp(block.timestamp + COOLDOWN);
         _unassign(ALICE, MINER, GATED_MIN);
@@ -566,6 +599,7 @@ contract PrefundedMiningPowerLedgerTest is PrefundedMiningStack {
         assertEq(module.heldStakeOf(ALICE), GATED_MIN);
         assertEq(module.withdrawableOf(ALICE), 0);
         assertEq(module.removingOf(MINER), GATED_MIN);
+        assertEq(module.assignedOf(MINER), LOCK);
         _assertBooks();
 
         vm.prank(ALICE);
@@ -579,11 +613,17 @@ contract PrefundedMiningPowerLedgerTest is PrefundedMiningStack {
         module.withdraw(GATED_MIN + 1);
 
         // The held stake still backs MINER this challenge: a real proof mints.
-        (bool eligible,, uint256 stake,) = module.eligibilityOf(MINER);
+        (bool eligible,, uint256 stake) = module.eligibilityOf(MINER);
         assertTrue(eligible);
-        assertEq(stake, GATED_MIN);
+        assertEq(stake, GATED_MIN + LOCK);
         uint256 tokenId = _win(MINER);
         assertEq(nft.ownerOf(tokenId), MINER);
+        assertEq(module.assignedOf(MINER), 0);
+        assertEq(module.unassignedOf(ALICE), GATED_MIN);
+        // The acceptance itself opened the next challenge: the hold lifted.
+        assertEq(module.latestChallengeId(), c + 1);
+        assertEq(module.heldStakeOf(ALICE), 0);
+        _assertBooks();
 
         // Next challenge: the hold is gone and so is MINER's eligibility.
         _activate();
@@ -591,7 +631,7 @@ contract PrefundedMiningPowerLedgerTest is PrefundedMiningStack {
         assertEq(module.heldStakeOf(ALICE), 0);
         assertEq(module.withdrawableOf(ALICE), GATED_MIN);
         uint8 reason;
-        (eligible, reason, stake,) = module.eligibilityOf(MINER);
+        (eligible, reason, stake) = module.eligibilityOf(MINER);
         assertFalse(eligible);
         assertEq(reason, 2);
         assertEq(stake, 0);
@@ -691,7 +731,7 @@ contract PrefundedMiningPowerLedgerTest is PrefundedMiningStack {
         _attach(module);
         assertEq(module.latestChallengeId(), c);
         assertEq(module.removingOf(MINER), GATED_MIN);
-        (bool eligible, uint8 reason, uint256 stake,) = module.eligibilityOf(MINER);
+        (bool eligible, uint8 reason, uint256 stake) = module.eligibilityOf(MINER);
         assertFalse(eligible);
         assertEq(reason, 2);
         assertEq(stake, 0);
@@ -705,11 +745,13 @@ contract PrefundedMiningPowerLedgerTest is PrefundedMiningStack {
     /// @dev Held stake re-assigned to W2 mid-challenge is pending there: W2
     /// is frozen at 0 and W1 keeps its frozen stake — one challenge, one
     /// wallet. Bouncing it back out of W2 (a pending-part unassign) does not
-    /// release the hold. Next challenge W2 counts and W1 does not.
+    /// release the hold. W1 passes the gate on that frozen stake, but its
+    /// live assigned stake is gone, so its win cannot pay the lock and the
+    /// proof is rejected (`InsufficientFunds`) — the stake never pays for two
+    /// wallets either. Next challenge W2 counts and W1 does not.
     function testHeldStakeCannotCountTwiceInOneChallenge() public {
         _useGatedModule();
-        _fund(MINER2, LOCK);
-        _qualifyAndFund(ALICE, MINER, GATED_MIN, LOCK);
+        _qualify(ALICE, MINER, GATED_MIN);
         uint256 c = cid;
         vm.warp(block.timestamp + COOLDOWN);
         _unassign(ALICE, MINER, GATED_MIN);
@@ -734,11 +776,16 @@ contract PrefundedMiningPowerLedgerTest is PrefundedMiningStack {
         _assertStake(MINER2, false, 0);
         _assertBooks();
 
-        // Real core: W2 rejected, W1 mines.
+        // Real core: W2 rejected by the gate, W1 admitted but unpaid.
         (uint256 n,) = _nonce(MINER2);
         _expectNotEligible(2);
         _send(MINER2, n);
-        _win(MINER);
+        (n,) = _nonce(MINER);
+        vm.expectRevert(abi.encodeWithSelector(PrefundedMiningPower.InsufficientFunds.selector, 0, LOCK));
+        _send(MINER, n);
+        assertEq(nft.mintedEver(), 0);
+        assertEq(module.totalCommitted(), 0);
+        _nextChallenge();
 
         // Next challenge: W2 counts, W1 does not.
         _activate();
@@ -750,6 +797,7 @@ contract PrefundedMiningPowerLedgerTest is PrefundedMiningStack {
         _send(MINER, n);
         _win(MINER2);
         assertEq(module.heldStakeOf(ALICE), 0);
+        assertEq(module.assignedOf(MINER2), GATED_MIN - LOCK);
         _assertBooks();
     }
 
@@ -757,6 +805,13 @@ contract PrefundedMiningPowerLedgerTest is PrefundedMiningStack {
     // Fuzz: random sequences conserve every unit
     // ------------------------------------------------------------------
 
+    /// @dev Random deposit / assign / unassign / withdraw / warp / real-win
+    /// sequences over three depositors and two wallets (plus OUTSIDER):
+    /// the harness books (including backer consistency and
+    /// `pendingOf <= assignedOf`, `pendingBy <= assignedBy`) hold after every
+    /// action, a second backer is always refused, every win outcome follows
+    /// the frozen/live rule, and at the end every depositor gets back exactly
+    /// what it deposited minus the locks its stake paid.
     /// forge-config: default.fuzz.runs = 64
     /// forge-config: release.fuzz.runs = 64
     function testFuzz_RandomSequencesConserve(uint256 fuzzSeed) public {
@@ -765,6 +820,7 @@ contract PrefundedMiningPowerLedgerTest is PrefundedMiningStack {
         address[2] memory ws = [MINER, MINER2];
         uint256[3] memory inflow;
         uint256[3] memory outflow;
+        uint256[3] memory charged;
 
         for (uint256 i = 0; i < 48; i++) {
             uint256 r = uint256(keccak256(abi.encode(fuzzSeed, i)));
@@ -780,7 +836,15 @@ contract PrefundedMiningPowerLedgerTest is PrefundedMiningStack {
                 if (avail != 0) {
                     address w = module.assigneeOf(d);
                     if (w == address(0)) w = ws[(r >> 128) % 2];
-                    _assign(d, w, (amt % avail) + 1);
+                    address backer = module.backerOf(w);
+                    uint256 a = (amt % avail) + 1;
+                    if (backer != address(0) && backer != d) {
+                        vm.prank(d);
+                        vm.expectRevert(abi.encodeWithSelector(PrefundedMiningPower.WalletAlreadyBacked.selector, backer));
+                        module.assign(w, a);
+                    } else {
+                        _assign(d, w, a);
+                    }
                 }
             } else if (op == 2) {
                 uint256 assigned = module.assignedBy(d);
@@ -825,10 +889,12 @@ contract PrefundedMiningPowerLedgerTest is PrefundedMiningStack {
             } else if (op == 4) {
                 vm.warp(block.timestamp + ((r >> 128) % (2 * COOLDOWN)));
             } else {
-                // Real proof: the winner's stake is frozen for the open
-                // challenge and a new challenge opens.
-                address winner = (r >> 128) % 3 == 0 ? OUTSIDER : ws[(r >> 130) % 2];
-                _win(winner);
+                // Real proof: admitted on the frozen stake, paid from the live
+                // one; an acceptance opens a new challenge.
+                address paidBy = _fuzzWin((r >> 128) % 3 == 0 ? OUTSIDER : ws[(r >> 130) % 2]);
+                for (uint256 k = 0; k < 3; k++) {
+                    if (paidBy != address(0) && ds[k] == paidBy) charged[k] += LOCK;
+                }
                 assertEq(module.latestChallengeId(), core.activeChallengeId());
             }
             _assertBooks();
@@ -848,29 +914,26 @@ contract PrefundedMiningPowerLedgerTest is PrefundedMiningStack {
                 _withdraw(d, avail);
                 outflow[k] += avail;
             }
-            assertEq(outflow[k], inflow[k], "depositor not made whole");
-            assertEq(token.balanceOf(d), inflow[k], "depositor balance");
+            assertEq(outflow[k] + charged[k], inflow[k], "depositor not made whole");
+            assertEq(token.balanceOf(d), inflow[k] - charged[k], "depositor balance");
             _assertBooks();
         }
+        uint256 outsiderLeft = module.assignedBy(OUTSIDER_BACKER);
+        if (outsiderLeft != 0) _unassign(OUTSIDER_BACKER, OUTSIDER, outsiderLeft);
+        uint256 outsiderFree = module.unassignedOf(OUTSIDER_BACKER);
+        if (outsiderFree != 0) _withdraw(OUTSIDER_BACKER, outsiderFree);
         assertEq(module.totalStake(), 0);
         assertEq(module.totalAssigned(), 0);
-        // S6: every accepted proof committed LOCK of its winner's mint funds
-        // (released only in S7). The winners take back their unused funds;
-        // what remains in the module is exactly the commitments.
-        address[3] memory winners = [OUTSIDER, MINER, MINER2];
-        for (uint256 k = 0; k < 3; k++) {
-            uint256 left = module.fundsOf(winners[k]);
-            if (left != 0) {
-                vm.prank(winners[k]);
-                module.withdrawFunds(left);
-            }
-        }
-        assertEq(module.totalFunds(), 0);
+        // Every accepted proof committed LOCK of its winner's backer's stake
+        // (claimable only after a burn); what remains in the module is
+        // exactly the commitments.
         assertEq(module.totalCommitted(), LOCK * nft.mintedEver());
         assertEq(token.balanceOf(address(module)), module.totalCommitted());
         _assertBooks();
         assertEq(module.assignedOf(MINER), 0);
         assertEq(module.assignedOf(MINER2), 0);
+        assertEq(module.backerOf(MINER), address(0));
+        assertEq(module.backerOf(MINER2), address(0));
     }
 
     // ------------------------------------------------------------------
@@ -885,22 +948,54 @@ contract PrefundedMiningPowerLedgerTest is PrefundedMiningStack {
     }
 
     function _assertStake(address wallet, bool eligible, uint256 stake) private view {
-        (bool e,, uint256 s,) = module.eligibilityOf(wallet);
+        (bool e,, uint256 s) = module.eligibilityOf(wallet);
         assertEq(e, eligible, "eligible");
         assertEq(s, stake, "frozen stake");
     }
 
-    /// @dev Swap the attached base module for a curve-enabled one. S6: the
-    /// wallets these tests mine with are funded BEFORE attach (enough for
-    /// every possible win), so their funds count from the attach challenge.
+    /// @dev One real submission by `winner` in the active challenge. Returns
+    /// the backer whose stake paid the lock, or address(0) when the proof was
+    /// rejected — by the gate (frozen stake below the floor) or by settlement
+    /// (admitted, but live assigned stake below LOCK).
+    function _fuzzWin(address winner) private returns (address paidBy) {
+        _activate();
+        (bool eligible,,) = module.eligibilityOf(winner);
+        uint256 live = module.assignedOf(winner);
+        address backer = module.backerOf(winner);
+        (uint256 nonce,) = _nonce(winner);
+        if (!eligible) {
+            _expectNotEligible(2);
+            _send(winner, nonce);
+        } else if (live < LOCK) {
+            vm.expectRevert(abi.encodeWithSelector(PrefundedMiningPower.InsufficientFunds.selector, live, LOCK));
+            _send(winner, nonce);
+        } else {
+            _send(winner, nonce);
+            assertEq(module.assignedOf(winner), live - LOCK);
+            paidBy = backer;
+        }
+    }
+
+    /// @dev Swap the attached base module for a curve-enabled one (floor
+    /// MIN_STAKE == LOCK). S6: OUTSIDER is backed for up to 48 wins and the
+    /// next challenge is opened so that stake counts (OUTSIDER only ever
+    /// submits base-target digests, so its own multiplier never matters).
     function _useCurvedModule() private {
         _detach();
-        _deployModule(0, LOCK, COOLDOWN, CURVE_UNIT, address(0));
-        _fund(OUTSIDER, 48 * LOCK);
-        _fund(MINER, 48 * LOCK);
-        _fund(MINER2, 48 * LOCK);
+        _deployModule(LOCK, LOCK, COOLDOWN, CURVE_UNIT, address(0));
         _attach(module);
         assertEq(module.CURVE_UNIT(), CURVE_UNIT);
+        _backOutsider(48);
+        _nextChallenge();
+    }
+
+    /// @dev OUTSIDER_BACKER stakes exactly `wins` wins' worth for OUTSIDER
+    /// (floor rule: MIN_STAKE + (wins - 1) * LOCK). Pending until the next
+    /// snapshot.
+    function _backOutsider(uint256 wins) private {
+        uint256 stake = module.MIN_STAKE() + (wins - 1) * LOCK;
+        _deposit(OUTSIDER_BACKER, stake);
+        _assign(OUTSIDER_BACKER, OUTSIDER, stake);
     }
 
     /// @dev Mirrors `HunterMiningCore._effectiveTarget`: widen by the

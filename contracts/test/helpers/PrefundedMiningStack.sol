@@ -317,28 +317,21 @@ abstract contract PrefundedMiningStack is Test {
         _activate();
     }
 
-    /// @dev FUNDER mints `amount` fixture HUNTER and funds `wallet` with it
-    /// (mint funds belong to the wallet). The wallet is tracked so
-    /// `_assertBooks` can prove the funds sum. Funds are pending for the
-    /// open challenge and count from the next snapshot.
-    function _fund(address wallet, uint256 amount) internal {
-        _trackWallet(wallet);
-        token.mint(FUNDER, amount);
-        vm.startPrank(FUNDER);
-        token.approve(address(module), amount);
-        module.fund(wallet, amount);
-        vm.stopPrank();
+    /// @dev Floor rule: `depositor` stakes exactly enough for `wallet` to
+    /// win `wins` times (one per challenge) — `MIN_STAKE + (wins - 1) *
+    /// LOCK_PER_MINT`, read from `module` — then the next challenge opens
+    /// and is activated, as in `_qualify`. After the last paid win the
+    /// wallet's stake is `MIN_STAKE - LOCK_PER_MINT`, below the floor.
+    function _qualifyFor(address depositor, address wallet, uint256 wins) internal returns (uint256 stake) {
+        require(wins != 0, "wins == 0");
+        stake = module.MIN_STAKE() + (wins - 1) * module.LOCK_PER_MINT();
+        _qualify(depositor, wallet, stake);
     }
 
-    /// @dev `_qualify` plus mint funds: `depositor` stakes `stake` for
-    /// `wallet` and FUNDER funds it with `funds`, both before the next
-    /// challenge opens, so both have matured once it is activated.
-    function _qualifyAndFund(address depositor, address wallet, uint256 stake, uint256 funds) internal {
-        _deposit(depositor, stake);
-        _assign(depositor, wallet, stake);
-        _fund(wallet, funds);
-        _nextChallenge();
-        _activate();
+    /// @dev `claimant` claims the lock of burned `tokenId` to itself (S7).
+    function _claim(uint256 tokenId, address claimant) internal {
+        vm.prank(claimant);
+        module.claimCommitted(tokenId);
     }
 
     /// @dev Expects the next call to revert with the gate's `NotEligible(reason)`.
@@ -354,9 +347,12 @@ abstract contract PrefundedMiningStack is Test {
     /// assigned stake sums to `totalAssigned` and equals the sum of its
     /// backers' `assignedBy`; a depositor's held stake never exceeds what
     /// it still has in the module and `withdrawableOf` is exactly the unheld
-    /// unassigned part). Mint funds: tracked wallets' `fundsOf` sum to
-    /// `totalFunds`, live pending funds never exceed `fundsOf`, and the
-    /// unreleased locks over every minted token id sum to `totalCommitted`.
+    /// unassigned part). One funder per wallet: `backerOf[w]` is nonzero
+    /// exactly while `assignedOf[w]` is, and then that backer's `assignedBy`
+    /// is the whole of `assignedOf[w]` and its assignee is `w`. Locks: the
+    /// unreleased locks over every minted token id sum to `totalCommitted`
+    /// (released locks are excluded, and each released lock belongs to a
+    /// burned NFT), and the balance covers `totalStake + totalCommitted`.
     /// Only exact while all ledger calls go through the tracking helpers
     /// (or `_trackDepositor` / `_trackWallet`).
     function _assertBooks() internal view virtual {
@@ -366,7 +362,7 @@ abstract contract PrefundedMiningStack is Test {
 
         assertGe(
             token.balanceOf(address(module)),
-            module.totalStake() + module.totalFunds() + module.totalCommitted(),
+            module.totalStake() + module.totalCommitted(),
             "module insolvent"
         );
         assertLe(module.totalAssigned(), module.totalStake(), "module over-assigned");
@@ -402,30 +398,33 @@ abstract contract PrefundedMiningStack is Test {
                 if (module.assigneeOf(d) == w) backers += module.assignedBy(d);
             }
             assertEq(backers, module.assignedOf(w), "wallet != sum of backers");
-        }
-        assertEq(assignedSum, module.totalAssigned(), "wallet sums != totalAssigned");
-
-        uint256 fundsSum;
-        for (uint256 j = 0; j < trackedWallets.length; j++) {
-            address w = trackedWallets[j];
-            uint256 walletFunds = module.fundsOf(w);
-            fundsSum += walletFunds;
-            uint256 eligibleFunds = module.eligibleFundsOf(w);
-            assertLe(eligibleFunds, walletFunds, "eligible funds > funds");
-            if (module.fundsEpoch(w) == module.latestChallengeId()) {
-                assertLe(module.pendingFunds(w), walletFunds, "pending funds > funds");
-                assertEq(eligibleFunds, walletFunds - module.pendingFunds(w), "eligible != funds - pending");
+            address backer = module.backerOf(w);
+            if (module.assignedOf(w) == 0) {
+                assertEq(backer, address(0), "backer without stake");
             } else {
-                assertEq(eligibleFunds, walletFunds, "stale pending still excluded");
+                assertTrue(backer != address(0), "stake without backer");
+                assertEq(module.assignedBy(backer), module.assignedOf(w), "backer != wallet stake");
+                assertEq(module.assigneeOf(backer), w, "backer backs another wallet");
             }
         }
-        assertEq(fundsSum, module.totalFunds(), "wallet funds != totalFunds");
+        assertEq(assignedSum, module.totalAssigned(), "wallet sums != totalAssigned");
 
         uint256 committedSum;
         uint256 minted = nft.mintedEver();
         for (uint256 id = 1; id <= minted; id++) {
-            (uint256 amount,,,, bool released) = module.committedOf(id);
-            if (!released) committedSum += amount;
+            (uint256 amount,,,,, bool released) = module.committedOf(id);
+            if (!released) {
+                committedSum += amount;
+            } else {
+                // S7: a lock is only ever released for a burned NFT.
+                assertTrue(amount != 0, "released lock without amount");
+                assertFalse(lifecycle.currentMember(id).alive, "released lock of a live member");
+                bool ownerReadable;
+                try nft.ownerOf(id) returns (address) {
+                    ownerReadable = true;
+                } catch {}
+                assertFalse(ownerReadable, "released lock of an unburned NFT");
+            }
         }
         assertEq(committedSum, module.totalCommitted(), "unreleased locks != totalCommitted");
     }

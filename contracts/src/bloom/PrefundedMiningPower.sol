@@ -7,6 +7,7 @@ import {SafeERC20} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol
 import {ReentrancyGuard} from "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
 import {Math} from "@openzeppelin/contracts/utils/math/Math.sol";
 import {IMiningPower} from "./IMiningPower.sol";
+import {WeightedHistory} from "./libraries/WeightedHistory.sol";
 
 /// @dev Read surface of the immutable `HunterMiningCore` this module is bound
 /// to. `challengeState` returns the core's `ChallengeState` ordinal (the enum
@@ -27,13 +28,30 @@ interface IPrefundedProofNftView {
     function mintedEver() external view returns (uint256);
 }
 
-/// @title Prefunded Mining Power — stake-gated, per-mint-funded Mining Power module
+/// @dev Read surface of the core's `PROOF_NFT` used by release: `ownerOf`
+/// reverts once a token is burned, and `LIFECYCLE` is the NFT's immutable
+/// lifecycle pointer (the burn authority that records the beneficiary).
+interface IPrefundedNftView {
+    function ownerOf(uint256 tokenId) external view returns (address);
+    function LIFECYCLE() external view returns (address);
+}
+
+/// @dev Read surface of the NFT's `HunterLifecycle` used by release:
+/// `finalBeneficiary` is fixed once, inside the burn, to the burning owner;
+/// `currentMember` reverts for an id the lifecycle never saw.
+interface IPrefundedLifecycleView {
+    function finalBeneficiary(uint256 tokenId) external view returns (address);
+    function currentMember(uint256 tokenId) external view returns (WeightedHistory.Member memory);
+}
+
+/// @title Prefunded Mining Power — stake-gated Mining Power module with a per-mint stake lock
 /// @notice Replacement for `MiningPowerCustody`. A mining wallet may only have a
-/// proof accepted while (a) at least `MIN_STAKE` HUNTER staked by third-party
-/// depositors is assigned to it for the open challenge and (b) it holds at
-/// least `LOCK_PER_MINT` HUNTER of prefunded mint funds. Each accepted proof
-/// moves `LOCK_PER_MINT` from the wallet's funds into a per-token commitment
-/// that is released only to the final beneficiary once that NFT is burned.
+/// proof accepted while at least `MIN_STAKE` HUNTER staked by its (single,
+/// third-party) backer counts for it in the open challenge. Each accepted
+/// proof moves `LOCK_PER_MINT` out of that assigned stake into a per-token
+/// commitment that is released only to the final beneficiary once that NFT
+/// is burned. There is no separate mint-funds bucket (owner decision
+/// 2026-09-25): the lock is paid from the stake itself.
 /// The optional power bonus reuses the old custody's log curve and is disabled
 /// when `CURVE_UNIT == 0` (multiplier fixed at 1.0x).
 /// @dev Immutable, no proxy, no owner, no admin withdrawal. Every Mining Core
@@ -42,42 +60,66 @@ interface IPrefundedProofNftView {
 /// `miningCore` and makes NO token calls — hooks only move internal
 /// accounting, so a hostile or paused token can never block proof
 /// acceptance, detach or shutdown. Tokens move only in user-initiated
-/// entry points, each guarded by measured receipts and a solvency check.
+/// entry points, each guarded by measured receipts and a solvency check
+/// (`balance >= totalStake + totalCommitted`).
 ///
 /// Defaults standing in for open S0 decisions (each flagged "S0 default"):
 /// - S0 default 1: power bonus disabled by deploying with `CURVE_UNIT = 0`;
 ///   the old custody curve is retained for a nonzero unit.
-/// - S0 default 2: mint funds are owned by the mining wallet they fund.
+/// - S0 default 2: moot — there are no mint funds; the lock is taken from
+///   the stake assigned to the winning wallet (owner decision 2026-09-25).
 /// - S0 default 3: a one-way failsafe is included via the immutable
 ///   `FAILSAFE_GUARDIAN` (address(0) = no failsafe).
-/// - S0 default 4: stake and funds count only from the NEXT challenge
-///   snapshot after they arrive (strict), including right after attach.
+/// - S0 default 4: stake counts only from the NEXT challenge snapshot after
+///   it is assigned (strict), including right after attach.
 /// - S0 default 5: token over-receipt (balance delta > requested) reverts.
-/// - S0 default 6: the funding/staking depositor must differ from the mining
-///   wallet (self-assignment reverts).
+/// - S0 default 6: the staking depositor must differ from the mining wallet
+///   (self-assignment reverts).
 /// - S0 default 7: the HUNTER token is a test fixture until the canonical
 ///   token is bound.
 ///
-/// Slice status (S6): the stake ledger is live — `deposit`, `assign`,
+/// Stake and lock rules (owner decision 2026-09-25):
+/// - One funder per mining wallet: `backerOf[wallet]` is the only depositor
+///   whose stake is assigned to it; another depositor's `assign` reverts
+///   `WalletAlreadyBacked` until that stake is gone (the slot is cleared
+///   when `assignedOf[wallet]` reaches 0, by unassign or by locks). As
+///   before, a depositor backs one wallet at a time (`MustUnassignFirst`)
+///   and never itself (`SelfAssignment`).
+/// - Floor rule: a wallet is eligible while its frozen stake for the
+///   challenge is >= `MIN_STAKE`, and each win consumes `LOCK_PER_MINT` of
+///   the live assigned stake, so stake `MIN_STAKE + (n - 1) * LOCK_PER_MINT`
+///   pays for exactly `n` wins (one per challenge). The constructor
+///   requires `MIN_STAKE >= LOCK_PER_MINT`.
+/// - Frozen vs live: the gate admits on the FROZEN stake (assigns after the
+///   challenge opened excluded, matured removals after it opened added
+///   back); settlement charges the LIVE `assignedOf` / `assignedBy`. The two
+///   differ only by the removals added back (`removingOf`) and pending
+///   assigns, so a wallet whose backer unassigned matured stake mid-challenge
+///   can pass the gate yet have less than `LOCK_PER_MINT` live: that
+///   acceptance reverts `InsufficientFunds` and the proof is rejected. Held
+///   stake (`heldBy`) sits in the backer's unassigned balance, not in
+///   `assignedOf`, so it can keep counting for the challenge but can never be
+///   locked.
+///
+/// Slice status (S7): the stake ledger is live — `deposit`, `assign`,
 /// `unassign` and `withdraw` port `MiningPowerCustody`'s accounting (pending
 /// and removing buckets, per-depositor pending share, per-wallet lazy freeze)
 /// with a wall-clock `EXIT_COOLDOWN` in place of the old 12-proof unlock
 /// delay. Matured stake unassigned during the open challenge still counts
 /// for it and is held in the module until the next snapshot (`heldBy`,
 /// `withdrawableOf`), so stake never leaves while it counts.
-/// Mint funds are live: `fund` credits a mining wallet (S0 default 2: the
-/// funds belong to that wallet) and `withdrawFunds` returns them to it.
-/// Funds arriving while a challenge is open are pending for it and count
-/// from the next snapshot (`pendingFunds` / `fundsEpoch`).
 /// `powerMultiplierWad` is the eligibility gate: it freezes the wallet's
 /// stake for the challenge and REVERTS `NotEligible(2)` below `MIN_STAKE`
-/// and `NotEligible(3)` when its eligible (non-pending) funds are below
-/// `LOCK_PER_MINT` (unless the failsafe fired), then writes a transient
-/// eligibility note (challenge id, miner). `onProofAccepted` settles the
-/// per-mint lock from that note in the same transaction — `LOCK_PER_MINT`
-/// moves from the miner's funds into `_committed[tokenId]` for the token
-/// the core is about to mint — and clears it. Release of a lock (S7) and
-/// the failsafe entry point (S8) are not implemented yet.
+/// (unless the failsafe fired), then writes a transient eligibility note
+/// (challenge id, miner). `onProofAccepted` settles the per-mint lock from
+/// that note in the same transaction — `LOCK_PER_MINT` moves from the
+/// miner's live assigned stake (and its backer's) into `_committed[tokenId]`
+/// for the token the core is about to mint — and clears it.
+/// Release is live: once the NFT is burned, `claimCommitted` /
+/// `claimCommittedTo` pay its lock to the lifecycle's `finalBeneficiary`
+/// (the owner who burned it), so the companion right follows the NFT through
+/// transfers, sales and loan defaults and is never bound to the original
+/// miner or its backer. The failsafe entry point (S8) is not implemented yet.
 /// Challenge bookkeeping (`wired`, `retired`, `latestChallengeId`,
 /// `lastAcceptedProofs`) mirrors `MiningPowerCustody` exactly so the module
 /// is a drop-in for the core.
@@ -119,6 +161,9 @@ contract PrefundedMiningPower is IMiningPower, ReentrancyGuard {
     error GateDisabled();
     error InsufficientUnassigned(uint256 available, uint256 requested);
     error InsufficientAssigned(uint256 available, uint256 requested);
+    /// @dev Settlement only: the winner's live assigned stake (and its
+    /// backer's) is below the lock. Name kept from the two-bucket design; it
+    /// means insufficient assigned stake.
     error InsufficientFunds(uint256 available, uint256 requested);
     error WrongAssignee(address expected, address provided);
     error MustUnassignFirst(address currentAssignee);
@@ -139,15 +184,19 @@ contract PrefundedMiningPower is IMiningPower, ReentrancyGuard {
     error DebitMismatch();
     error InvalidConfiguration();
     error StakeHeldUntilNextChallenge(uint256 held, uint256 epoch);
+    error WalletAlreadyBacked(address backer);
 
     event Deposited(address indexed depositor, uint256 amount);
     event Assigned(address indexed depositor, address indexed miningWallet, uint256 amount, uint256 timestamp);
     event Unassigned(address indexed depositor, address indexed miningWallet, uint256 amount, uint256 timestamp);
     event Withdrawn(address indexed depositor, uint256 amount);
-    event Funded(address indexed funder, address indexed miningWallet, uint256 amount);
-    event FundsWithdrawn(address indexed miningWallet, uint256 amount);
     event Committed(
-        uint256 indexed tokenId, address indexed miner, uint256 indexed challengeId, bytes32 digest, uint256 amount
+        uint256 indexed tokenId,
+        address indexed miner,
+        uint256 indexed challengeId,
+        address backer,
+        bytes32 digest,
+        uint256 amount
     );
     event Released(uint256 indexed tokenId, address indexed beneficiary, address indexed recipient, uint256 amount);
     event ChallengeSnapshotted(uint256 indexed challengeId);
@@ -173,22 +222,26 @@ contract PrefundedMiningPower is IMiningPower, ReentrancyGuard {
 
     /// @notice A per-token mint commitment, created by `onProofAccepted` for
     /// the token the core is minting and bound to that proof's challenge id
-    /// and digest (which equal the NFT's `birthData`).
+    /// and digest (which equal the NFT's `birthData`). `backer` is the
+    /// depositor whose assigned stake paid it (informational: the release
+    /// goes to the NFT's final beneficiary, never back to the backer).
     struct Lock {
         uint256 amount;
         uint256 challengeId;
         bytes32 digest;
         address miner;
+        address backer;
         bool released;
     }
 
-    /// @notice The HUNTER token staked, funded and committed here.
+    /// @notice The HUNTER token staked and committed here.
     IERC20 public immutable HUNTER;
     /// @notice The only address allowed to call the Mining Power hooks.
     address public immutable miningCore;
     /// @notice E — minimum frozen stake a mining wallet needs for a challenge.
     uint256 public immutable MIN_STAKE;
-    /// @notice L — HUNTER committed from the wallet's funds per accepted proof.
+    /// @notice L — HUNTER moved from the winner's assigned stake into the
+    /// commitment of each accepted proof. Never above `MIN_STAKE`.
     uint256 public immutable LOCK_PER_MINT;
     /// @notice Seconds after the latest assign before a depositor may unassign.
     uint256 public immutable EXIT_COOLDOWN;
@@ -197,12 +250,11 @@ contract PrefundedMiningPower is IMiningPower, ReentrancyGuard {
     /// @notice One-way failsafe key for `disableRequirement`; zero = none.
     address public immutable FAILSAFE_GUARDIAN;
 
-    /// @notice Sum of all deposited stake held here (unassigned + assigned).
+    /// @notice Sum of all deposited stake held here (unassigned + assigned);
+    /// a lock moves `LOCK_PER_MINT` of it into `totalCommitted`.
     uint256 public totalStake;
     /// @notice Sum of stake currently assigned to mining wallets.
     uint256 public totalAssigned;
-    /// @notice Sum of uncommitted mint funds across mining wallets.
-    uint256 public totalFunds;
     /// @notice Sum of per-token commitments not yet released.
     uint256 public totalCommitted;
 
@@ -226,6 +278,11 @@ contract PrefundedMiningPower is IMiningPower, ReentrancyGuard {
     mapping(address => uint256) public assignedBy;
     /// @notice The single mining wallet a depositor's assigned stake backs.
     mapping(address => address) public assigneeOf;
+    /// @notice The single depositor backing a mining wallet (one funder per
+    /// wallet): nonzero exactly while `assignedOf[wallet] != 0`, and then
+    /// `assignedBy[backerOf[wallet]] == assignedOf[wallet]`. Its stake pays
+    /// the wallet's per-mint locks.
+    mapping(address => address) public backerOf;
     /// @notice `block.timestamp` of this depositor's latest assign (a top-up
     /// resets it). The cooldown clock is per depositor so a shared mining
     /// wallet's other backers can never reset or shorten it.
@@ -261,15 +318,6 @@ contract PrefundedMiningPower is IMiningPower, ReentrancyGuard {
     /// so they no longer count if the module is re-wired into it.
     uint256 public holdWaivedEpoch;
 
-    /// @notice Uncommitted mint funds owned by each mining wallet (S0
-    /// default 2). Only the wallet itself can withdraw them.
-    mapping(address => uint256) public fundsOf;
-    /// @notice Funds that arrived while `fundsEpoch[wallet]` was the latest
-    /// challenge. They are part of `fundsOf` but do not count for that
-    /// challenge — funds count from the next snapshot, like stake.
-    mapping(address => uint256) public pendingFunds;
-    /// @notice Challenge the wallet's `pendingFunds` belong to.
-    mapping(address => uint256) public fundsEpoch;
     /// @dev Per-token commitments, keyed by the NFT token id.
     mapping(uint256 => Lock) internal _committed;
 
@@ -296,6 +344,9 @@ contract PrefundedMiningPower is IMiningPower, ReentrancyGuard {
         }
         if (miningCore_ == address(0) || miningCore_.code.length == 0) revert InvalidConfiguration();
         if (lockPerMint_ == 0) revert InvalidConfiguration();
+        // Floor rule: an admitted wallet always had at least one lock's worth
+        // of frozen stake.
+        if (minStake_ < lockPerMint_) revert InvalidConfiguration();
         HUNTER = IERC20(hunterToken);
         miningCore = miningCore_;
         MIN_STAKE = minStake_;
@@ -314,11 +365,13 @@ contract PrefundedMiningPower is IMiningPower, ReentrancyGuard {
     /// @dev Freezes `miner`'s stake for `challengeId` (stake assigned after the
     /// challenge opened does not count; matured stake unassigned after it
     /// opened still does) and, unless the failsafe fired, reverts
-    /// `NotEligible(2)` when the frozen stake is below `MIN_STAKE` and
-    /// `NotEligible(3)` when the wallet's eligible funds (`fundsOf` minus
-    /// funds still pending for this challenge) are below `LOCK_PER_MINT`.
-    /// Funds are not frozen: withdrawing them mid-challenge makes the wallet
-    /// ineligible from the next gate call on.
+    /// `NotEligible(2)` when the frozen stake is below `MIN_STAKE`. The
+    /// gate does not look at the live balance the lock is paid from:
+    /// settlement re-checks it (`InsufficientFunds`), see the contract notes
+    /// on frozen vs live stake. The core only calls this inside
+    /// `submitProof`, so a freeze persists only for an accepted proof, and
+    /// every acceptance opens a new challenge — the frozen value is never
+    /// reused for a second win.
     /// Ineligibility MUST be a revert: in this core a zero or below-base
     /// multiplier is NOT a ban — `_effectiveTarget` treats anything
     /// `<= POWER_BASE_WAD` as the plain base target, so returning 0 would still
@@ -332,7 +385,6 @@ contract PrefundedMiningPower is IMiningPower, ReentrancyGuard {
         uint256 frozen = _freeze(challengeId, miner);
         if (!gateDisabled) {
             if (frozen < MIN_STAKE) revert NotEligible(2);
-            if (_eligibleFunds(miner) < LOCK_PER_MINT) revert NotEligible(3);
             // A zero note means "no note"; challenge 0 is never opened by the
             // core, but refuse it rather than admit a proof that settles nothing.
             if (challengeId == 0) revert ChallengeNotOpen(0);
@@ -383,9 +435,9 @@ contract PrefundedMiningPower is IMiningPower, ReentrancyGuard {
     /// With a note: requires the noted challenge to equal the core's active
     /// challenge (`StaleChallengeId` otherwise), the two independent counters
     /// to agree (`CounterMismatch`), no existing lock for the token
-    /// (`LockAlreadyExists`) and `LOCK_PER_MINT` of the miner's funds
-    /// (`InsufficientFunds`, unreachable after the gate but checked anyway);
-    /// then moves `LOCK_PER_MINT` from `fundsOf[miner]` into the lock.
+    /// (`LockAlreadyExists`) and a backer with at least `LOCK_PER_MINT` of
+    /// live assigned stake on the miner (`InsufficientFunds`); then moves
+    /// `LOCK_PER_MINT` of that stake into the lock (see `_settleLock`).
     /// Without a note — the attach bootstrap (`setMiningPower` /
     /// `attachMiningPowerLate` call this with no submission) or a disabled
     /// gate — no lock is taken. The note is always cleared so it can never
@@ -449,7 +501,9 @@ contract PrefundedMiningPower is IMiningPower, ReentrancyGuard {
     /// @dev Refused unless this module is the wired, non-retired module and
     /// the failsafe has not fired — no stake is parked on a module that can
     /// never mint. A depositor backs one wallet at a time and can never be
-    /// its own mining wallet (S0 default 6).
+    /// its own mining wallet (S0 default 6), and a wallet has one backer at a
+    /// time: while it has assigned stake, only that backer may add to it
+    /// (`WalletAlreadyBacked`).
     function assign(address miningWallet, uint256 amount) external nonReentrant {
         // `retired` is checked first: a terminal detach also clears `wired`,
         // so checking `wired` first would make `Retired` unreachable.
@@ -461,6 +515,8 @@ contract PrefundedMiningPower is IMiningPower, ReentrancyGuard {
         if (amount == 0) revert ZeroAmount();
         address current = assigneeOf[msg.sender];
         if (current != address(0) && current != miningWallet) revert MustUnassignFirst(current);
+        address backer = backerOf[miningWallet];
+        if (assignedOf[miningWallet] != 0 && backer != msg.sender) revert WalletAlreadyBacked(backer);
         uint256 available = unassignedOf[msg.sender];
         if (amount > available) revert InsufficientUnassigned(available, amount);
         _retagBuckets(miningWallet);
@@ -471,6 +527,7 @@ contract PrefundedMiningPower is IMiningPower, ReentrancyGuard {
         pendingOf[miningWallet] += amount;
         pendingBy[msg.sender] += amount;
         assigneeOf[msg.sender] = miningWallet;
+        backerOf[miningWallet] = msg.sender;
         assignTimestamp[msg.sender] = block.timestamp;
         emit Assigned(msg.sender, miningWallet, amount, block.timestamp);
     }
@@ -507,6 +564,7 @@ contract PrefundedMiningPower is IMiningPower, ReentrancyGuard {
         totalAssigned -= amount;
         unassignedOf[msg.sender] += amount;
         if (assignedBy[msg.sender] == 0) assigneeOf[msg.sender] = address(0);
+        if (assignedOf[miningWallet] == 0) backerOf[miningWallet] = address(0);
         emit Unassigned(msg.sender, miningWallet, amount, block.timestamp);
     }
 
@@ -536,66 +594,24 @@ contract PrefundedMiningPower is IMiningPower, ReentrancyGuard {
     }
 
     // ------------------------------------------------------------------
-    // Mint funds (S6)
+    // Release (S7)
     // ------------------------------------------------------------------
 
-    /// @notice Credit mint funds to `miningWallet`. Anyone may fund any
-    /// wallet; the funds then belong to that wallet (S0 default 2) and only
-    /// it can withdraw them. Funds that arrive while a challenge is open are
-    /// pending for it and count from the next snapshot.
-    /// @dev Refused once the module is retired or the failsafe fired — no
-    /// further mint can take a lock, so nothing would ever need the funds.
-    /// Allowed before attach: at the attach challenge no wallet can have
-    /// matured stake (assign requires `wired`, and a re-wire requires zero
-    /// assignments), so pre-attach funds can only matter from the next
-    /// snapshot whenever `MIN_STAKE > 0`.
-    /// Credits the measured balance delta; a zero receipt, an over-receipt
-    /// (S0 default 5) or a shrinking balance reverts `UnsupportedTokenReceipt`.
-    /// Solvency is checked before and after.
-    function fund(address miningWallet, uint256 amount) external nonReentrant {
-        if (retired) revert Retired();
-        if (gateDisabled) revert GateDisabled();
-        if (miningWallet == address(0)) revert ZeroAddress();
-        if (amount == 0) revert ZeroAmount();
-        uint256 beforeBal = _requireSolvent();
-        HUNTER.safeTransferFrom(msg.sender, address(this), amount);
-        uint256 afterBal = HUNTER.balanceOf(address(this));
-        if (afterBal <= beforeBal || afterBal - beforeBal > amount) revert UnsupportedTokenReceipt();
-        uint256 received = afterBal - beforeBal;
-        uint256 latest = latestChallengeId;
-        if (fundsEpoch[miningWallet] < latest) {
-            pendingFunds[miningWallet] = 0;
-            fundsEpoch[miningWallet] = latest;
-        }
-        pendingFunds[miningWallet] += received;
-        fundsOf[miningWallet] += received;
-        totalFunds += received;
-        _requireSolvent();
-        emit Funded(msg.sender, miningWallet, received);
+    /// @notice Pay the lock of burned `tokenId` to the caller, who must be
+    /// the NFT's final beneficiary (the owner who burned it).
+    /// @dev See `_release`. The right is bound to the tokenId, not to the
+    /// miner: whoever owned the NFT when it was burned is the only claimant.
+    function claimCommitted(uint256 tokenId) external nonReentrant {
+        _release(tokenId, msg.sender);
     }
 
-    /// @notice Withdraw the caller's own uncommitted mint funds. Allowed in
-    /// every state, including mid-challenge: the gate reads funds live, so a
-    /// wallet that withdraws below `LOCK_PER_MINT` is simply ineligible from
-    /// then on. Committed (locked) funds are never withdrawable here.
-    /// @dev Funds still pending for the open challenge leave first, so the
-    /// wallet's eligible (matured) funds shrink only by the excess. The
-    /// module's balance must drop by exactly `amount` (`DebitMismatch`
-    /// otherwise) and stay solvent before and after (`Insolvency`).
-    function withdrawFunds(uint256 amount) external nonReentrant {
-        if (amount == 0) revert ZeroAmount();
-        uint256 available = fundsOf[msg.sender];
-        if (amount > available) revert InsufficientFunds(available, amount);
-        uint256 beforeBal = _requireSolvent();
-        uint256 pending = _livePendingFunds(msg.sender);
-        if (pending != 0) pendingFunds[msg.sender] = pending - Math.min(pending, amount);
-        fundsOf[msg.sender] = available - amount;
-        totalFunds -= amount;
-        HUNTER.safeTransfer(msg.sender, amount);
-        uint256 afterBal = HUNTER.balanceOf(address(this));
-        if (afterBal > beforeBal || beforeBal - afterBal != amount) revert DebitMismatch();
-        _requireSolvent();
-        emit FundsWithdrawn(msg.sender, amount);
+    /// @notice As `claimCommitted`, but the final beneficiary directs the
+    /// payment to `recipient` (for example a fresh wallet, or one that can
+    /// receive when the beneficiary address cannot). Only the beneficiary can
+    /// choose the recipient; `recipient` must be nonzero.
+    function claimCommittedTo(uint256 tokenId, address recipient) external nonReentrant {
+        if (recipient == address(0)) revert ZeroAddress();
+        _release(tokenId, recipient);
     }
 
     // ------------------------------------------------------------------
@@ -605,39 +621,44 @@ contract PrefundedMiningPower is IMiningPower, ReentrancyGuard {
     /// @notice What the gate would decide for `wallet` in the current
     /// (latest snapshotted) challenge, without freezing anything.
     /// @dev `stake` is exactly what `_freeze` would record (or has recorded)
-    /// for `latestChallengeId`; `funds` is `eligibleFundsOf(wallet)`, exactly
-    /// what the gate compares. Reason codes: 0 ok, 1 this module is not the
-    /// live one (not wired, or retired), 2 stake below `MIN_STAKE`, 3 funds
-    /// below `LOCK_PER_MINT` (checked after the stake).
-    /// Once the failsafe fired a wired module reports eligible (reason 0).
-    function eligibilityOf(address wallet)
-        external
-        view
-        returns (bool eligible, uint8 reason, uint256 stake, uint256 funds)
-    {
+    /// for `latestChallengeId` — what the gate compares. Reason codes: 0 ok,
+    /// 1 this module is not the live one (not wired, or retired), 2 stake
+    /// below `MIN_STAKE`. Once the failsafe fired a wired module reports
+    /// eligible (reason 0). Like the gate, this does not check the live
+    /// assigned stake a win is paid from: a wallet whose backer unassigned
+    /// matured stake this challenge can read eligible while `assignedOf` is
+    /// below `LOCK_PER_MINT`, and its acceptance would revert
+    /// `InsufficientFunds`.
+    function eligibilityOf(address wallet) external view returns (bool eligible, uint8 reason, uint256 stake) {
         stake = _frozenPreview(wallet);
-        funds = _eligibleFunds(wallet);
-        if (!wired || retired) return (false, 1, stake, funds);
-        if (gateDisabled) return (true, 0, stake, funds);
-        if (stake < MIN_STAKE) return (false, 2, stake, funds);
-        if (funds < LOCK_PER_MINT) return (false, 3, stake, funds);
-        return (true, 0, stake, funds);
-    }
-
-    /// @notice Mint funds that count for the current (latest snapshotted)
-    /// challenge: `fundsOf(wallet)` minus funds still pending for it.
-    function eligibleFundsOf(address wallet) external view returns (uint256) {
-        return _eligibleFunds(wallet);
+        if (!wired || retired) return (false, 1, stake);
+        if (gateDisabled) return (true, 0, stake);
+        if (stake < MIN_STAKE) return (false, 2, stake);
+        return (true, 0, stake);
     }
 
     /// @notice The commitment recorded for `tokenId` (all zero if none).
+    /// `backer` is the depositor whose assigned stake paid the lock.
     function committedOf(uint256 tokenId)
         external
         view
-        returns (uint256 amount, uint256 challengeId, bytes32 digest, address miner, bool released)
+        returns (uint256 amount, uint256 challengeId, bytes32 digest, address miner, address backer, bool released)
     {
         Lock storage lock = _committed[tokenId];
-        return (lock.amount, lock.challengeId, lock.digest, lock.miner, lock.released);
+        return (lock.amount, lock.challengeId, lock.digest, lock.miner, lock.backer, lock.released);
+    }
+
+    /// @notice Client view of the release rule for `tokenId`, without the
+    /// caller check: `amount` is the unreleased lock (0 when none or already
+    /// released), `beneficiary` the lifecycle's final beneficiary once the
+    /// NFT is burned (0 while it lives or when the burn cannot be confirmed)
+    /// and `claimable` whether `beneficiary` could claim `amount` now
+    /// (`claimCommitted` still requires solvency and an exact debit).
+    function claimableOf(uint256 tokenId) external view returns (bool claimable, address beneficiary, uint256 amount) {
+        Lock storage lock = _committed[tokenId];
+        if (!lock.released) amount = lock.amount;
+        beneficiary = _burnedBeneficiary(tokenId);
+        claimable = amount != 0 && beneficiary != address(0);
     }
 
     /// @notice The multiplier the gate would return for `wallet` in the
@@ -695,9 +716,27 @@ contract PrefundedMiningPower is IMiningPower, ReentrancyGuard {
     // Internal
     // ------------------------------------------------------------------
 
-    /// @dev Moves `LOCK_PER_MINT` of `miner`'s funds into the commitment for
-    /// the token the core is about to mint. See `onProofAccepted` for the
-    /// call-ordering facts every check below relies on.
+    /// @dev Moves `LOCK_PER_MINT` of the stake assigned to `miner` into the
+    /// commitment for the token the core is about to mint. See
+    /// `onProofAccepted` for the call-ordering facts the core checks rely on.
+    /// The lock is paid from the LIVE assigned stake: `backerOf[miner]` must
+    /// exist and both `assignedOf[miner]` and `assignedBy[backer]` must cover
+    /// it, else `InsufficientFunds(available, LOCK_PER_MINT)` — the name is
+    /// kept from the two-bucket design; it means "insufficient assigned
+    /// stake". The gate admitted on the frozen stake, which can exceed the
+    /// live balance only by matured stake unassigned during this challenge
+    /// (`removingOf`, still counting) — such a win is refused here rather
+    /// than paid from stake that already left the wallet, and the proof is
+    /// rejected with it.
+    /// A lock is neither an assign nor an unassign: `removingOf`, `heldBy`
+    /// and the frozen value for this challenge are left alone (within one
+    /// challenge a wallet's frozen stake is not changed by its own win; the
+    /// next challenge freezes the lower live balance). The lock consumes
+    /// matured stake first: the wallet's and backer's pending shares are
+    /// only clamped down to the remaining balance when the remainder can no
+    /// longer hold them, so `pendingOf <= assignedOf` and
+    /// `pendingBy <= assignedBy` always hold. When the wallet's stake reaches
+    /// zero its backer slot (and the backer's assignee) is cleared.
     function _settleLock(uint256 noteChallenge, address miner) private {
         IPrefundedMiningCoreView core = IPrefundedMiningCoreView(miningCore);
         uint256 active = core.activeChallengeId();
@@ -707,28 +746,86 @@ contract PrefundedMiningPower is IMiningPower, ReentrancyGuard {
         if (tokenId != coreCount) revert CounterMismatch(coreCount, tokenId);
         if (_committed[tokenId].amount != 0) revert LockAlreadyExists(tokenId);
         uint256 lockAmount = LOCK_PER_MINT;
-        uint256 available = fundsOf[miner];
+        address backer = backerOf[miner];
+        uint256 walletStake = assignedOf[miner];
+        uint256 backerStake = backer == address(0) ? 0 : assignedBy[backer];
+        uint256 available = Math.min(walletStake, backerStake);
         if (available < lockAmount) revert InsufficientFunds(available, lockAmount);
         bytes32 digest = core.previousAcceptedDigest();
-        fundsOf[miner] = available - lockAmount;
-        totalFunds -= lockAmount;
+        uint256 walletLeft = walletStake - lockAmount;
+        uint256 backerLeft = backerStake - lockAmount;
+        assignedOf[miner] = walletLeft;
+        assignedBy[backer] = backerLeft;
+        totalAssigned -= lockAmount;
+        totalStake -= lockAmount;
         totalCommitted += lockAmount;
-        _committed[tokenId] =
-            Lock({amount: lockAmount, challengeId: noteChallenge, digest: digest, miner: miner, released: false});
-        emit Committed(tokenId, miner, noteChallenge, digest, lockAmount);
+        if (pendingOf[miner] > walletLeft) pendingOf[miner] = walletLeft;
+        if (pendingBy[backer] > backerLeft) pendingBy[backer] = backerLeft;
+        if (walletLeft == 0) backerOf[miner] = address(0);
+        if (backerLeft == 0) assigneeOf[backer] = address(0);
+        _committed[tokenId] = Lock({
+            amount: lockAmount,
+            challengeId: noteChallenge,
+            digest: digest,
+            miner: miner,
+            backer: backer,
+            released: false
+        });
+        emit Committed(tokenId, miner, noteChallenge, backer, digest, lockAmount);
     }
 
-    /// @dev `pendingFunds` still applies only while it belongs to the latest
-    /// challenge; once a newer snapshot opened it has matured.
-    function _livePendingFunds(address wallet) private view returns (uint256) {
-        return fundsEpoch[wallet] == latestChallengeId ? pendingFunds[wallet] : 0;
+    /// @dev Releases the lock of `tokenId` to `recipient`. Requires a lock
+    /// (`NoLock`), not yet released (`AlreadyReleased`), a confirmed burn
+    /// (`TokenNotBurned`) and `msg.sender` equal to the lifecycle's final
+    /// beneficiary (`NotBeneficiary`). Checks-effects-interactions: the
+    /// solvency baseline is read BEFORE the books change, then the lock is
+    /// marked released and `totalCommitted` reduced, then the transfer; the
+    /// module balance must drop by exactly the lock (`DebitMismatch`; an
+    /// outbound token tax is borne by the recipient, never by the other
+    /// obligations) and stay solvent. Any failure — including a token that
+    /// refuses the transfer — reverts the whole call, so the lock stays
+    /// claimable and can be retried later. Never reads mining state: a lock
+    /// stays claimable after detach, retirement or mint-out, forever.
+    function _release(uint256 tokenId, address recipient) private {
+        Lock storage lock = _committed[tokenId];
+        uint256 amount = lock.amount;
+        if (amount == 0) revert NoLock(tokenId);
+        if (lock.released) revert AlreadyReleased(tokenId);
+        address beneficiary = _burnedBeneficiary(tokenId);
+        if (beneficiary == address(0)) revert TokenNotBurned(tokenId);
+        if (msg.sender != beneficiary) revert NotBeneficiary(msg.sender);
+        uint256 beforeBal = _requireSolvent();
+        lock.released = true;
+        totalCommitted -= amount;
+        HUNTER.safeTransfer(recipient, amount);
+        uint256 afterBal = HUNTER.balanceOf(address(this));
+        if (afterBal > beforeBal || beforeBal - afterBal != amount) revert DebitMismatch();
+        _requireSolvent();
+        emit Released(tokenId, beneficiary, recipient, amount);
     }
 
-    /// @dev Funds that count for `latestChallengeId`. Live pending never
-    /// exceeds `fundsOf`: `fund` adds to both, `withdrawFunds` takes pending
-    /// first, and a lock only takes funds the gate saw as matured.
-    function _eligibleFunds(address wallet) private view returns (uint256) {
-        return fundsOf[wallet] - _livePendingFunds(wallet);
+    /// @dev The final beneficiary of `tokenId` when its burn is confirmed,
+    /// else address(0). Mirrors `HunterBackingVault._requireBurned`, with
+    /// the NFT and lifecycle derived from the immutable core (never
+    /// supplied): the lifecycle member must exist and be neither alive nor
+    /// eligible (a reverting `currentMember` means "not burned"), `ownerOf`
+    /// must revert, and the lifecycle must have recorded a nonzero
+    /// beneficiary. The lifecycle writes the beneficiary inside the burn,
+    /// after ending the member, and token ids are never re-minted, so the
+    /// three signals agree on the real stack; each is still checked so no
+    /// single inconsistent read can release a lock early.
+    function _burnedBeneficiary(uint256 tokenId) private view returns (address) {
+        IPrefundedNftView proofNft = IPrefundedNftView(IPrefundedMiningCoreView(miningCore).PROOF_NFT());
+        IPrefundedLifecycleView lifecycle = IPrefundedLifecycleView(proofNft.LIFECYCLE());
+        try lifecycle.currentMember(tokenId) returns (WeightedHistory.Member memory member) {
+            if (member.alive || member.eligible) return address(0);
+        } catch {
+            return address(0);
+        }
+        try proofNft.ownerOf(tokenId) returns (address) {
+            return address(0);
+        } catch {}
+        return lifecycle.finalBeneficiary(tokenId);
     }
 
     /// @dev Pending from an older epoch has matured and queued removals have
@@ -794,6 +891,6 @@ contract PrefundedMiningPower is IMiningPower, ReentrancyGuard {
     /// balance read so callers can reuse it as their measurement baseline.
     function _requireSolvent() private view returns (uint256 balance) {
         balance = HUNTER.balanceOf(address(this));
-        if (balance < totalStake + totalFunds + totalCommitted) revert Insolvency();
+        if (balance < totalStake + totalCommitted) revert Insolvency();
     }
 }

@@ -62,34 +62,37 @@ contract DoubleSubmitMiner {
 
 /// @dev TEST-ONLY stand-in "core" that drives its OWN module through call
 /// sequences the real core never produces, to prove settlement fails closed.
-/// It is also the mining wallet (so it can withdraw its own funds between the
-/// gate and `onProofAccepted`). Never used in a positive-path mining test.
+/// It doubles as its own `PROOF_NFT` (counter views) and as the depositor
+/// backing the probed mining wallet, so it can pull that stake between the
+/// gate and `onProofAccepted`. Never used in a positive-path mining test.
 contract ForeignSequenceCore {
     uint256 public activeChallengeId;
     uint256 public nftsMintedEver = 1;
+    uint256 public mintedEver;
     bytes32 public constant previousAcceptedDigest = keccak256("foreign digest");
 
     function PROOF_NFT() external view returns (address) {
         return address(this);
     }
 
-    function mintedEver() external pure returns (uint256) {
-        return 0;
-    }
-
-    function approveAndFund(PrefundedMiningPower m, IERC20 token, uint256 amount) external {
+    /// @dev Opens `id`, then stakes `amount` from this contract for `miner`
+    /// (pending in `id`, matured from the next id).
+    function openAndStake(PrefundedMiningPower m, IERC20 token, uint256 id, address miner, uint256 amount) external {
+        activeChallengeId = id;
+        m.snapshotChallenge(id);
         token.approve(address(m), amount);
-        m.fund(address(this), amount);
+        m.deposit(amount);
+        m.assign(miner, amount);
     }
 
     /// @dev Gate admits `id`, the core's active id then reads `activeAtAccept`.
-    function gateThenAccept(PrefundedMiningPower m, uint256 id, uint256 activeAtAccept)
+    function gateThenAccept(PrefundedMiningPower m, uint256 id, uint256 activeAtAccept, address miner)
         external
         returns (bytes memory err)
     {
         activeChallengeId = id;
         m.snapshotChallenge(id);
-        m.powerMultiplierWad(id, address(this));
+        m.powerMultiplierWad(id, miner);
         activeChallengeId = activeAtAccept;
         try m.onProofAccepted(1) {}
         catch (bytes memory e) {
@@ -97,30 +100,49 @@ contract ForeignSequenceCore {
         }
     }
 
-    /// @dev Gate admits, the wallet withdraws its funds, then acceptance.
-    function gateWithdrawThenAccept(PrefundedMiningPower m, uint256 id) external returns (bytes memory err) {
+    /// @dev Gate admits, the backer (this contract) pulls `amount` of the
+    /// miner's stake, then acceptance.
+    function gateUnassignThenAccept(PrefundedMiningPower m, uint256 id, address miner, uint256 amount)
+        external
+        returns (bytes memory err)
+    {
         activeChallengeId = id;
         m.snapshotChallenge(id);
-        m.powerMultiplierWad(id, address(this));
-        m.withdrawFunds(m.fundsOf(address(this)));
+        m.powerMultiplierWad(id, miner);
+        m.unassign(miner, amount);
         try m.onProofAccepted(1) {}
         catch (bytes memory e) {
             err = e;
         }
     }
 
-    /// @dev Opens `first`, funds (pending there), then opens challenge 0 —
-    /// which the real core never does — so those funds count, then gates 0.
-    function gateChallengeZero(PrefundedMiningPower m, IERC20 token, uint256 first)
+    /// @dev A second gate + acceptance in the SAME challenge, counters moved
+    /// on by one mint. The real core never does this (every acceptance opens
+    /// a new challenge); the gate returns the cached frozen stake.
+    function acceptAgainSameChallenge(PrefundedMiningPower m, address miner) external returns (bytes memory err) {
+        mintedEver = nftsMintedEver;
+        nftsMintedEver += 1;
+        m.powerMultiplierWad(activeChallengeId, miner);
+        try m.onProofAccepted(2) {}
+        catch (bytes memory e) {
+            err = e;
+        }
+    }
+
+    /// @dev Opens `first`, stakes this contract's whole balance for `miner`
+    /// (pending there), then opens challenge 0 — which the real core never
+    /// does — so that stake counts, then gates 0.
+    function gateChallengeZero(PrefundedMiningPower m, IERC20 token, uint256 first, address miner)
         external
         returns (bytes memory err)
     {
         m.snapshotChallenge(first);
         uint256 bal = token.balanceOf(address(this));
         token.approve(address(m), bal);
-        m.fund(address(this), bal);
+        m.deposit(bal);
+        m.assign(miner, bal);
         m.snapshotChallenge(0);
-        try m.powerMultiplierWad(0, address(this)) {}
+        try m.powerMultiplierWad(0, miner) {}
         catch (bytes memory e) {
             err = e;
         }
@@ -307,6 +329,13 @@ contract NoteProbeCore {
         return 0;
     }
 
+    /// @dev Opens `id` (wires the module) so stake can be assigned before
+    /// the probed challenge.
+    function open(PrefundedMiningPower m, uint256 id) external {
+        activeChallengeId = id;
+        m.snapshotChallenge(id);
+    }
+
     function probe(PrefundedMiningPower m, uint256 id, address miner)
         external
         returns (uint256 noteDuring, address minerDuring, uint256 noteAfter, address minerAfter)
@@ -320,10 +349,12 @@ contract NoteProbeCore {
     }
 }
 
-/// @notice S5 (VLT-56) eligibility gate and S6 (VLT-57) mint funds and
-/// per-mint lock of PrefundedMiningPower on the REAL stack: every admitted
-/// or rejected proof goes through `HunterMiningCore.submitProof`. All
-/// amounts are TEST-ONLY fixture values.
+/// @notice S5 (VLT-56) eligibility gate and S6 (VLT-57) per-mint lock of
+/// PrefundedMiningPower on the REAL stack: every admitted or rejected proof
+/// goes through `HunterMiningCore.submitProof`. Owner decision 2026-09-25:
+/// the lock is taken from the stake assigned to the winning wallet (one
+/// backer per wallet); there are no mint funds. All amounts are TEST-ONLY
+/// fixture values.
 contract PrefundedMiningPowerSettlementTest is PrefundedMiningStack {
     using stdStorage for StdStorage;
 
@@ -346,13 +377,12 @@ contract PrefundedMiningPowerSettlementTest is PrefundedMiningStack {
     // ------------------------------------------------------------------
 
     function testEligibleDirectSubmissionMints() public {
-        // S6: funds for two mints, so MINER is still eligible after one.
-        _qualifyAndFund(ALICE, MINER, MIN_STAKE, 2 * LOCK);
-        (bool eligible, uint8 reason, uint256 stake, uint256 funds) = module.eligibilityOf(MINER);
+        // Stake for two wins, so MINER is still eligible after one.
+        _qualifyFor(ALICE, MINER, 2);
+        (bool eligible, uint8 reason, uint256 stake) = module.eligibilityOf(MINER);
         assertTrue(eligible);
         assertEq(reason, 0);
-        assertEq(stake, MIN_STAKE);
-        assertEq(funds, 2 * LOCK);
+        assertEq(stake, MIN_STAKE + LOCK);
 
         uint256 moduleBal = token.balanceOf(address(module));
         uint256 id = cid;
@@ -372,9 +402,10 @@ contract PrefundedMiningPowerSettlementTest is PrefundedMiningStack {
         _assertNoteEmpty();
         // Hooks moved no tokens.
         assertEq(token.balanceOf(address(module)), moduleBal);
-        // The stake stays assigned, so MINER stays eligible next challenge.
-        (eligible,,,) = module.eligibilityOf(MINER);
+        // MIN_STAKE stays assigned, so MINER stays eligible next challenge.
+        (eligible,, stake) = module.eligibilityOf(MINER);
         assertTrue(eligible);
+        assertEq(stake, MIN_STAKE);
         _assertBooks();
     }
 
@@ -385,7 +416,7 @@ contract PrefundedMiningPowerSettlementTest is PrefundedMiningStack {
 
         // (b) matured stake one wei below MIN_STAKE.
         _qualify(ALICE, MINER2, MIN_STAKE - 1);
-        (bool eligible, uint8 reason, uint256 stake,) = module.eligibilityOf(MINER2);
+        (bool eligible, uint8 reason, uint256 stake) = module.eligibilityOf(MINER2);
         assertFalse(eligible);
         assertEq(reason, 2);
         assertEq(stake, MIN_STAKE - 1);
@@ -394,10 +425,6 @@ contract PrefundedMiningPowerSettlementTest is PrefundedMiningStack {
     }
 
     function testStakeAssignedAfterScheduleCountsNextChallenge() public {
-        // S6: both wallets hold mint funds that have matured well before the
-        // final challenge, so only the stake decides here.
-        _fund(MINER, LOCK);
-        _fund(MINER2, LOCK);
         // Challenge scheduled but seed not yet readable (WAITING_FOR_SEED).
         _nextChallenge();
         assertEq(uint8(core.challengeState()), uint8(HunterMiningCore.ChallengeState.WAITING_FOR_SEED));
@@ -410,7 +437,7 @@ contract PrefundedMiningPowerSettlementTest is PrefundedMiningStack {
 
         address[2] memory ws = [MINER, MINER2];
         for (uint256 i = 0; i < 2; i++) {
-            (bool eligible, uint8 reason, uint256 stake,) = module.eligibilityOf(ws[i]);
+            (bool eligible, uint8 reason, uint256 stake) = module.eligibilityOf(ws[i]);
             assertFalse(eligible);
             assertEq(reason, 2);
             assertEq(stake, 0);
@@ -424,7 +451,7 @@ contract PrefundedMiningPowerSettlementTest is PrefundedMiningStack {
         _nextChallenge();
         _activate();
         for (uint256 i = 0; i < 2; i++) {
-            (bool eligible, uint8 reason, uint256 stake,) = module.eligibilityOf(ws[i]);
+            (bool eligible, uint8 reason, uint256 stake) = module.eligibilityOf(ws[i]);
             assertTrue(eligible);
             assertEq(reason, 0);
             assertEq(stake, MIN_STAKE);
@@ -440,7 +467,6 @@ contract PrefundedMiningPowerSettlementTest is PrefundedMiningStack {
         SettlementMiner miner = new SettlementMiner();
         SameTxStaker funder = new SameTxStaker(IERC20(address(token)), module);
         token.mint(address(funder), MIN_STAKE);
-        _fund(address(miner), LOCK); // S6: funds never the blocker here
         _activate();
         (uint256 nonce,) = _nonce(address(miner));
 
@@ -451,6 +477,7 @@ contract PrefundedMiningPowerSettlementTest is PrefundedMiningStack {
         assertEq(core.acceptedProofs(), 0);
         assertEq(module.totalStake(), 0);
         assertEq(module.assignedOf(address(miner)), 0);
+        assertEq(module.backerOf(address(miner)), address(0));
         assertEq(token.balanceOf(address(funder)), MIN_STAKE);
         _assertNoteEmpty();
 
@@ -461,6 +488,9 @@ contract PrefundedMiningPowerSettlementTest is PrefundedMiningStack {
         (nonce,) = _nonce(address(miner));
         miner.submit(core, cid, seed, nonce, basket);
         assertEq(nft.ownerOf(1), address(miner));
+        (,,,, address backer,) = module.committedOf(1);
+        assertEq(backer, address(funder));
+        assertEq(module.assignedOf(address(miner)), MIN_STAKE - LOCK);
         _assertNoteEmpty();
     }
 
@@ -498,14 +528,16 @@ contract PrefundedMiningPowerSettlementTest is PrefundedMiningStack {
         _assertFlashRolledBack(lender, miner);
     }
 
+    /// @dev Mid-challenge move (cooldown 0): the removal applies from the
+    /// next challenge and the new assignment counts from the next challenge,
+    /// so in the open challenge the stake still admits MINER (not MINER2).
+    /// Single bucket: MINER's live stake is gone, so its admitted win cannot
+    /// pay the lock and is rejected (`InsufficientFunds`); the next
+    /// challenge the same stake qualifies — and pays for — MINER2 only.
     function testOneStakeQualifiesOneWalletPerChallenge() public {
-        // S6: both wallets hold matured mint funds; only the stake moves.
-        _fund(MINER2, LOCK);
-        _qualifyAndFund(ALICE, MINER, MIN_STAKE, LOCK);
+        _qualify(ALICE, MINER, MIN_STAKE);
         _assertEligibility(MINER, true, 0, MIN_STAKE);
 
-        // Mid-challenge move (cooldown 0): removal applies next challenge,
-        // the new assignment counts from next challenge.
         _unassign(ALICE, MINER, MIN_STAKE);
         _assign(ALICE, MINER2, MIN_STAKE);
         _assertEligibility(MINER, true, 0, MIN_STAKE);
@@ -513,10 +545,15 @@ contract PrefundedMiningPowerSettlementTest is PrefundedMiningStack {
         (uint256 nonce,) = _nonce(MINER2);
         _expectNotEligible(2);
         _send(MINER2, nonce);
-        _win(MINER);
+        (nonce,) = _nonce(MINER);
+        Snap memory s0 = _snap(MINER);
+        vm.expectRevert(abi.encodeWithSelector(PrefundedMiningPower.InsufficientFunds.selector, 0, LOCK));
+        _send(MINER, nonce);
+        _assertSnap(s0, MINER);
         _assertBooks();
 
         // Next challenge: the stake qualifies MINER2 only.
+        _nextChallenge();
         _activate();
         _assertEligibility(MINER, false, 2, 0);
         _assertEligibility(MINER2, true, 0, MIN_STAKE);
@@ -524,9 +561,10 @@ contract PrefundedMiningPowerSettlementTest is PrefundedMiningStack {
         _expectNotEligible(2);
         _send(MINER, nonce);
         _win(MINER2);
-        assertEq(nft.mintedEver(), 2);
-        assertEq(nft.ownerOf(1), MINER);
-        assertEq(nft.ownerOf(2), MINER2);
+        assertEq(nft.mintedEver(), 1);
+        assertEq(nft.ownerOf(1), MINER2);
+        (,,,, address backer,) = module.committedOf(1);
+        assertEq(backer, ALICE);
         _assertNoteEmpty();
         _assertBooks();
     }
@@ -543,12 +581,6 @@ contract PrefundedMiningPowerSettlementTest is PrefundedMiningStack {
         m.deposit(MIN_STAKE);
         m.assign(MINER, MIN_STAKE);
         vm.stopPrank();
-        // S6: mint funds, so the win also settles a lock with the token bricked.
-        brick.mint(FUNDER, LOCK);
-        vm.startPrank(FUNDER);
-        brick.approve(address(m), LOCK);
-        m.fund(MINER, LOCK);
-        vm.stopPrank();
         _nextChallenge();
         _activate();
 
@@ -556,15 +588,18 @@ contract PrefundedMiningPowerSettlementTest is PrefundedMiningStack {
         vm.expectRevert(BrickableHunter.Bricked.selector);
         brick.balanceOf(address(m));
 
-        (bool eligible,,,) = m.eligibilityOf(MINER);
+        (bool eligible,,) = m.eligibilityOf(MINER);
         assertTrue(eligible);
         uint256 tokenId = _win(MINER);
         assertEq(nft.ownerOf(tokenId), MINER);
         assertEq(m.lastAcceptedProofs(), 1);
-        (uint256 locked,,, address lockMiner,) = m.committedOf(tokenId);
+        // The win also settled a lock from the stake with the token bricked.
+        (uint256 locked,,, address lockMiner, address lockBacker,) = m.committedOf(tokenId);
         assertEq(locked, LOCK);
         assertEq(lockMiner, MINER);
-        assertEq(m.fundsOf(MINER), 0);
+        assertEq(lockBacker, ALICE);
+        assertEq(m.assignedOf(MINER), MIN_STAKE - LOCK);
+        assertEq(m.totalStake(), MIN_STAKE - LOCK);
         assertEq(m.totalCommitted(), LOCK);
         _assertNoteEmptyOn(m);
 
@@ -582,16 +617,15 @@ contract PrefundedMiningPowerSettlementTest is PrefundedMiningStack {
     // ------------------------------------------------------------------
 
     function testPreviewsRunUnderStaticcall() public {
-        _qualifyAndFund(ALICE, MINER, MIN_STAKE, LOCK);
+        _qualify(ALICE, MINER, MIN_STAKE);
 
         (bool ok, bytes memory ret) =
             address(module).staticcall(abi.encodeCall(PrefundedMiningPower.eligibilityOf, (MINER)));
         assertTrue(ok);
-        (bool eligible, uint8 reason, uint256 stake, uint256 funds) = abi.decode(ret, (bool, uint8, uint256, uint256));
+        (bool eligible, uint8 reason, uint256 stake) = abi.decode(ret, (bool, uint8, uint256));
         assertTrue(eligible);
         assertEq(reason, 0);
         assertEq(stake, MIN_STAKE);
-        assertEq(funds, LOCK);
 
         (ok, ret) = address(module).staticcall(abi.encodeCall(PrefundedMiningPower.previewSubmit, (MINER)));
         assertTrue(ok);
@@ -632,26 +666,34 @@ contract PrefundedMiningPowerSettlementTest is PrefundedMiningStack {
     /// stand-in core (see `NoteProbeCore`): an enforcing gate writes
     /// (challengeId, miner) — S6 stores the id itself instead of S5's hash so
     /// settlement can re-check it against the core; `onProofAccepted`
-    /// settles from it and clears both; a disabled gate writes nothing.
+    /// settles from it (taking the lock from ALICE's stake) and clears both;
+    /// a disabled gate writes nothing.
     function testGateNoteKeyedByChallengeAndMinerAndClearedOnAccept() public {
         NoteProbeCore probeCore = new NoteProbeCore();
-        PrefundedMiningPower m = new PrefundedMiningPower(address(token), address(probeCore), 0, LOCK, 0, 0, address(0));
-        // Funded before the probe opens challenge 7, so they count in it.
-        token.mint(FUNDER, LOCK);
-        vm.startPrank(FUNDER);
+        PrefundedMiningPower m =
+            new PrefundedMiningPower(address(token), address(probeCore), LOCK, LOCK, 0, 0, address(0));
+        // Staked in challenge 6, so it counts in challenge 7.
+        probeCore.open(m, 6);
+        token.mint(ALICE, LOCK);
+        vm.startPrank(ALICE);
         token.approve(address(m), LOCK);
-        m.fund(MINER, LOCK);
+        m.deposit(LOCK);
+        m.assign(MINER, LOCK);
         vm.stopPrank();
         (uint256 noteDuring, address minerDuring, uint256 noteAfter, address minerAfter) = probeCore.probe(m, 7, MINER);
         assertEq(noteDuring, 7);
         assertEq(minerDuring, MINER);
         assertEq(noteAfter, 0);
         assertEq(minerAfter, address(0));
-        (uint256 amount, uint256 lockChallenge, bytes32 lockDigest, address lockMiner,) = m.committedOf(1);
+        (uint256 amount, uint256 lockChallenge, bytes32 lockDigest, address lockMiner, address lockBacker,) =
+            m.committedOf(1);
         assertEq(amount, LOCK);
         assertEq(lockChallenge, 7);
         assertEq(lockDigest, keccak256("probe digest"));
         assertEq(lockMiner, MINER);
+        assertEq(lockBacker, ALICE);
+        assertEq(m.assignedOf(MINER), 0);
+        assertEq(m.backerOf(MINER), address(0));
 
         PrefundedMiningPower off =
             new PrefundedMiningPower(address(token), address(probeCore), MIN_STAKE, LOCK, 0, 0, address(0));
@@ -659,22 +701,24 @@ contract PrefundedMiningPowerSettlementTest is PrefundedMiningStack {
         (noteDuring, minerDuring,,) = probeCore.probe(off, 7, MINER);
         assertEq(noteDuring, 0);
         assertEq(minerDuring, address(0));
+        (amount,,,,,) = off.committedOf(1);
+        assertEq(amount, 0);
     }
 
     function testEligibilityReasonOneWhenModuleNotLive() public {
-        _qualifyAndFund(ALICE, MINER, MIN_STAKE, LOCK);
+        _qualify(ALICE, MINER, MIN_STAKE);
         _assertEligibility(MINER, true, 0, MIN_STAKE);
 
         // A fresh, never-attached module is not the live one.
         PrefundedMiningPower fresh =
             new PrefundedMiningPower(address(token), address(core), MIN_STAKE, LOCK, 0, 0, address(0));
-        (bool eligible, uint8 reason,,) = fresh.eligibilityOf(MINER);
+        (bool eligible, uint8 reason,) = fresh.eligibilityOf(MINER);
         assertFalse(eligible);
         assertEq(reason, 1);
 
         // Non-terminal detach.
         _detach();
-        (eligible, reason,,) = module.eligibilityOf(MINER);
+        (eligible, reason,) = module.eligibilityOf(MINER);
         assertFalse(eligible);
         assertEq(reason, 1);
 
@@ -685,34 +729,34 @@ contract PrefundedMiningPowerSettlementTest is PrefundedMiningStack {
         core.stopMining();
         assertTrue(module.retired());
         stdstore.enable_packed_slots().target(address(module)).sig("gateDisabled()").checked_write(true);
-        (eligible, reason,,) = module.eligibilityOf(MINER);
+        (eligible, reason,) = module.eligibilityOf(MINER);
         assertFalse(eligible);
         assertEq(reason, 1);
     }
 
-    /// @dev S6 extension: random mint funds, funded either before the
-    /// challenge was scheduled (matured when `matured`) or after it
-    /// (pending), so reason 3 and the lock are covered too.
-    function testFuzz_PreviewMatchesGate(uint256 stakeSeed, bool matured, uint256 fundSeed, bool fundsEarly) public {
+    /// @dev Random stake, matured or not, plus a random top-up assigned while
+    /// the challenge is open (pending: never counts for it, but it is live
+    /// stake the lock may be paid from).
+    function testFuzz_PreviewMatchesGate(uint256 stakeSeed, bool matured, uint256 topUpSeed) public {
         uint256 amount = bound(stakeSeed, 0, 2 * MIN_STAKE);
-        uint256 f = bound(fundSeed, 0, 3 * LOCK);
+        uint256 topUp = bound(topUpSeed, 0, 3 * LOCK);
         if (amount != 0) {
             _deposit(ALICE, amount);
             _assign(ALICE, MINER, amount);
         }
-        if (fundsEarly && f != 0) _fund(MINER, f);
         if (matured) _nextChallenge();
         _activate();
-        if (!fundsEarly && f != 0) _fund(MINER, f);
+        if (topUp != 0) {
+            _deposit(ALICE, topUp);
+            _assign(ALICE, MINER, topUp);
+        }
 
-        uint256 expectFunds = fundsEarly && matured ? f : 0;
-        bool stakeOk = matured && amount >= MIN_STAKE;
-        (bool eligible, uint8 reason, uint256 stake, uint256 funds) = module.eligibilityOf(MINER);
-        assertEq(stake, matured ? amount : 0);
-        assertEq(funds, expectFunds);
-        assertEq(module.eligibleFundsOf(MINER), expectFunds);
-        assertEq(eligible, stakeOk && expectFunds >= LOCK);
-        assertEq(reason, eligible ? 0 : (stakeOk ? 3 : 2));
+        uint256 frozen = matured ? amount : 0;
+        bool eligible = frozen >= MIN_STAKE;
+        (bool e, uint8 reason, uint256 stake) = module.eligibilityOf(MINER);
+        assertEq(stake, frozen);
+        assertEq(e, eligible);
+        assertEq(reason, eligible ? 0 : 2);
         assertEq(module.previewSubmit(MINER), 1e18);
 
         (uint256 nonce,) = _nonce(MINER);
@@ -720,10 +764,14 @@ contract PrefundedMiningPowerSettlementTest is PrefundedMiningStack {
         if (!eligible) _expectNotEligible(reason);
         _send(MINER, nonce);
         assertEq(nft.mintedEver(), eligible ? before + 1 : before);
-        (uint256 locked,,, address lockMiner,) = module.committedOf(before + 1);
+        (uint256 locked,,, address lockMiner, address lockBacker,) = module.committedOf(before + 1);
         assertEq(locked, eligible ? LOCK : 0);
         assertEq(lockMiner, eligible ? MINER : address(0));
-        assertEq(module.fundsOf(MINER), eligible ? f - LOCK : f);
+        assertEq(lockBacker, eligible ? ALICE : address(0));
+        uint256 live = amount + topUp - (eligible ? LOCK : 0);
+        assertEq(module.assignedOf(MINER), live);
+        assertEq(module.assignedBy(ALICE), live);
+        assertEq(module.backerOf(MINER), live == 0 ? address(0) : ALICE);
         assertEq(module.totalCommitted(), eligible ? LOCK : 0);
         _assertNoteEmpty();
         _assertBooks();
@@ -731,7 +779,7 @@ contract PrefundedMiningPowerSettlementTest is PrefundedMiningStack {
 
     function testBonusCurve() public {
         // CURVE_UNIT == 0: 1.0x however large the stake.
-        _qualifyAndFund(CAROL, MINER, 1e30, LOCK);
+        _qualify(CAROL, MINER, 1e30);
         assertEq(module.previewSubmit(MINER), 1e18);
         _assertEligibility(MINER, true, 0, 1e30);
 
@@ -748,7 +796,6 @@ contract PrefundedMiningPowerSettlementTest is PrefundedMiningStack {
             wallets[i] = address(uint160(0xE000 + i));
             _deposit(depositor, stakes[i]);
             _assign(depositor, wallets[i], stakes[i]);
-            _fund(wallets[i], LOCK); // S6: matures with the stake
             // Pending stake previews at 1.0x.
             assertEq(module.previewSubmit(wallets[i]), 1e18);
         }
@@ -774,6 +821,8 @@ contract PrefundedMiningPowerSettlementTest is PrefundedMiningStack {
         core.submitProof(cid, seed, n1, basket);
         assertEq(nft.ownerOf(1), wallets[1]);
         assertGt(uint256(d1), base);
+        // The lock is L whatever the bonus; the next freeze sees the rest.
+        assertEq(module.assignedOf(wallets[1]), BONUS_UNIT - LOCK);
         _assertNoteEmpty();
     }
 
@@ -791,24 +840,26 @@ contract PrefundedMiningPowerSettlementTest is PrefundedMiningStack {
         uint256 tokenId = _win(MINER);
         assertEq(nft.ownerOf(tokenId), MINER);
         assertEq(module.lastAcceptedProofs(), 1);
+        _assertNoLock(tokenId);
         _assertNoteEmpty();
         // Still open in the following challenge.
         _win(MINER2);
+        assertEq(module.totalCommitted(), 0);
         _assertNoteEmpty();
     }
 
     // ------------------------------------------------------------------
-    // S6: mint funds and the per-mint lock (all through the real core)
+    // S6: the per-mint lock from the winner's assigned stake
     // ------------------------------------------------------------------
 
     function testEligibleDirectSubmissionMintsAndLocksOnce() public {
-        _qualifyAndFund(ALICE, MINER, MIN_STAKE, LOCK + 7);
+        _qualify(ALICE, MINER, MIN_STAKE + 7);
         uint256 moduleBal = token.balanceOf(address(module));
         uint256 id = cid;
         (uint256 nonce, bytes32 digest) = _nonce(MINER);
 
         vm.expectEmit(true, true, true, true, address(module));
-        emit PrefundedMiningPower.Committed(1, MINER, id, digest, LOCK);
+        emit PrefundedMiningPower.Committed(1, MINER, id, ALICE, digest, LOCK);
         _send(MINER, nonce);
 
         uint256 tokenId = nft.mintedEver();
@@ -820,172 +871,303 @@ contract PrefundedMiningPowerSettlementTest is PrefundedMiningStack {
         assertEq(birthDigest, digest);
         // Exactly one lock: nothing for the next id.
         _assertNoLock(tokenId + 1);
-        // Funds −L, totals moved, stake untouched, no token moved by hooks.
-        assertEq(module.fundsOf(MINER), 7);
-        assertEq(module.totalFunds(), 7);
+        // Every stake total −L, the backer recorded, no token moved by hooks.
+        uint256 left = MIN_STAKE + 7 - LOCK;
+        assertEq(module.assignedOf(MINER), left);
+        assertEq(module.assignedBy(ALICE), left);
+        assertEq(module.totalAssigned(), left);
+        assertEq(module.totalStake(), left);
         assertEq(module.totalCommitted(), LOCK);
-        assertEq(module.assignedOf(MINER), MIN_STAKE);
-        assertEq(module.assignedBy(ALICE), MIN_STAKE);
-        assertEq(module.totalStake(), MIN_STAKE);
-        assertEq(module.totalAssigned(), MIN_STAKE);
+        assertEq(module.backerOf(MINER), ALICE);
+        assertEq(module.assigneeOf(ALICE), MINER);
+        assertEq(module.unassignedOf(ALICE), 0);
         assertEq(token.balanceOf(address(module)), moduleBal);
-        assertEq(token.balanceOf(address(module)), MIN_STAKE + LOCK + 7);
-        // 7 left < L: no longer eligible (reason 3).
+        assertEq(token.balanceOf(address(module)), MIN_STAKE + 7);
+        assertEq(token.balanceOf(address(module)), module.totalStake() + module.totalCommitted());
+        // Below the floor now: not eligible next challenge (reason 2).
         _activate();
-        (bool eligible, uint8 reason,, uint256 funds) = module.eligibilityOf(MINER);
-        assertFalse(eligible);
-        assertEq(reason, 3);
-        assertEq(funds, 7);
+        _assertEligibility(MINER, false, 2, left);
+        _assertRejectedNoChange(MINER, 2);
         _assertNoteEmpty();
         _assertBooks();
     }
 
-    function testIneligibleWithoutFundsRevertsReason3() public {
-        // Stake ok, funds 0.
-        _qualify(ALICE, MINER, MIN_STAKE);
-        _assertGate(MINER, false, 3, MIN_STAKE, 0);
-        _assertRejectedNoChange(MINER, 3);
-
-        // Funds L-1 (matured): still reason 3.
-        _fund(MINER, LOCK - 1);
-        _nextChallenge();
-        _activate();
-        _assertGate(MINER, false, 3, MIN_STAKE, LOCK - 1);
-        _assertRejectedNoChange(MINER, 3);
-
-        // Topping up the missing wei mid-challenge is pending: still reason 3.
-        _fund(MINER, 1);
-        assertEq(module.fundsOf(MINER), LOCK);
-        _assertGate(MINER, false, 3, MIN_STAKE, LOCK - 1);
-        _assertRejectedNoChange(MINER, 3);
-
-        // Reason 2 still wins over reason 3 when both fail.
-        _activate();
-        _assertGate(MINER2, false, 2, 0, 0);
-        _assertRejectedNoChange(MINER2, 2);
-        assertEq(nft.mintedEver(), 0);
-        assertEq(module.totalCommitted(), 0);
-        _assertBooks();
-    }
-
-    function testMintFundsAddedAfterScheduleCountNextChallenge() public {
-        _deposit(ALICE, MIN_STAKE);
-        _assign(ALICE, MINER, MIN_STAKE);
-        _deposit(BOB, MIN_STAKE);
-        _assign(BOB, MINER2, MIN_STAKE);
-        _nextChallenge(); // stake matures in this challenge
-        // Challenge scheduled, seed not readable yet (WAITING_FOR_SEED).
-        assertEq(uint8(core.challengeState()), uint8(HunterMiningCore.ChallengeState.WAITING_FOR_SEED));
-        _fund(MINER, LOCK);
-        // Seed readable (ACTIVE).
-        _activate();
-        _fund(MINER2, LOCK);
-        address[2] memory ws = [MINER, MINER2];
-        for (uint256 i = 0; i < 2; i++) {
-            assertEq(module.pendingFunds(ws[i]), LOCK);
-            assertEq(module.fundsEpoch(ws[i]), cid);
-            _assertGate(ws[i], false, 3, MIN_STAKE, 0);
-            _assertRejectedNoChange(ws[i], 3);
+    /// @dev Floor rule: stake MIN_STAKE + 2L pays for exactly three wins, one
+    /// per challenge (each acceptance opens the next challenge, so the
+    /// frozen value is never reused); the fourth attempt, in the following
+    /// challenge, freezes MIN_STAKE - L and is rejected by the gate.
+    function testFloorRuleAllowsExactlyNWins() public {
+        uint256 stake = _qualifyFor(ALICE, MINER, 3);
+        assertEq(stake, MIN_STAKE + 2 * LOCK);
+        uint256[3] memory frozen = [MIN_STAKE + 2 * LOCK, MIN_STAKE + LOCK, MIN_STAKE];
+        for (uint256 i = 0; i < 3; i++) {
+            _activate();
+            _assertEligibility(MINER, true, 0, frozen[i]);
+            uint256 opened = cid;
+            uint256 tokenId = _win(MINER);
+            assertEq(tokenId, i + 1);
+            assertEq(module.latestChallengeId(), opened + 1);
+            (, bytes32 d, uint256 c,) = nft.birthData(tokenId);
+            _assertLock(tokenId, MINER, c, d);
+            assertEq(module.assignedOf(MINER), frozen[i] - LOCK);
         }
-
-        // Next snapshot (no win needed): both have matured.
-        _nextChallenge();
         _activate();
-        for (uint256 i = 0; i < 2; i++) {
-            _assertGate(ws[i], true, 0, MIN_STAKE, LOCK);
-        }
-        _win(MINER);
-        _win(MINER2);
-        (uint256 a1,,, address m1,) = module.committedOf(1);
-        (uint256 a2,,, address m2,) = module.committedOf(2);
-        assertEq(a1, LOCK);
-        assertEq(a2, LOCK);
-        assertEq(m1, MINER);
-        assertEq(m2, MINER2);
-
-        // A new top-up in a later challenge restarts the pending bucket.
-        _fund(MINER, 3 * LOCK);
-        assertEq(module.pendingFunds(MINER), 3 * LOCK);
-        assertEq(module.fundsEpoch(MINER), module.latestChallengeId());
-        assertEq(module.eligibleFundsOf(MINER), 0);
-        _assertNoteEmpty();
-        _assertBooks();
-    }
-
-    function testFundsForTwoLocksPayExactlyTwo() public {
-        _qualifyAndFund(ALICE, MINER, MIN_STAKE, 2 * LOCK);
-        assertEq(_win(MINER), 1);
-        assertEq(_win(MINER), 2);
-        assertEq(module.fundsOf(MINER), 0);
-        _activate();
-        _assertGate(MINER, false, 3, MIN_STAKE, 0);
-        _assertRejectedNoChange(MINER, 3);
-
-        for (uint256 t = 1; t <= 2; t++) {
-            (, bytes32 d, uint256 c,) = nft.birthData(t);
-            _assertLock(t, MINER, c, d);
-        }
-        _assertNoLock(3);
-        assertEq(module.totalCommitted(), 2 * LOCK);
-        assertEq(module.totalFunds(), 0);
+        _assertEligibility(MINER, false, 2, MIN_STAKE - LOCK);
+        _assertRejectedNoChange(MINER, 2);
+        _assertNoLock(4);
+        assertEq(module.totalCommitted(), 3 * LOCK);
+        assertEq(module.totalStake(), MIN_STAKE - LOCK);
         assertEq(token.balanceOf(address(module)), MIN_STAKE + 2 * LOCK);
         _assertBooks();
     }
 
-    function testFundsWithdrawnMidChallengeBlocksWin() public {
-        _qualifyAndFund(ALICE, MINER, MIN_STAKE, LOCK);
-        _assertGate(MINER, true, 0, MIN_STAKE, LOCK);
+    /// @dev The lock is always exactly L out of the LIVE assigned stake, not
+    /// a share of the frozen value: a top-up assigned in the open challenge
+    /// does not count for it (frozen = MIN_STAKE) but is part of the balance
+    /// the lock comes from. The lock consumes matured stake first, so the
+    /// pending top-up is untouched; the next challenge freezes what is left.
+    function testLockDeductedFromLiveStakeNotFrozen() public {
+        uint256 topUp = 3 * LOCK;
+        _qualify(ALICE, MINER, MIN_STAKE);
+        _deposit(ALICE, topUp);
+        _assign(ALICE, MINER, topUp);
+        _assertEligibility(MINER, true, 0, MIN_STAKE);
+        assertEq(module.assignedOf(MINER), MIN_STAKE + topUp);
+        assertEq(module.pendingOf(MINER), topUp);
 
-        vm.expectEmit(true, false, false, true, address(module));
-        emit PrefundedMiningPower.FundsWithdrawn(MINER, 1);
-        vm.prank(MINER);
-        module.withdrawFunds(1);
-        assertEq(token.balanceOf(MINER), 1);
-        _assertGate(MINER, false, 3, MIN_STAKE, LOCK - 1);
-        _assertRejectedNoChange(MINER, 3);
+        _win(MINER);
+        assertEq(module.assignedOf(MINER), MIN_STAKE + topUp - LOCK);
+        assertEq(module.assignedBy(ALICE), MIN_STAKE + topUp - LOCK);
+        assertEq(module.pendingOf(MINER), topUp);
+        assertEq(module.pendingBy(ALICE), topUp);
+        assertEq(module.totalCommitted(), LOCK);
 
-        // Re-funding in the same challenge is pending: still blocked.
-        _fund(MINER, 1);
-        _assertRejectedNoChange(MINER, 3);
-        assertEq(module.totalCommitted(), 0);
+        _activate();
+        _assertEligibility(MINER, true, 0, MIN_STAKE + topUp - LOCK);
         _assertBooks();
     }
 
-    /// @dev Pending funds leave first, so withdrawing only the fresh top-up
-    /// keeps the matured part eligible; withdrawing more eats into it.
-    function testWithdrawFundsTakesPendingFirst() public {
-        _qualifyAndFund(ALICE, MINER, MIN_STAKE, LOCK);
-        _fund(MINER, 50e18); // pending this challenge
-        assertEq(module.eligibleFundsOf(MINER), LOCK);
-        vm.prank(MINER);
-        module.withdrawFunds(50e18);
-        assertEq(module.pendingFunds(MINER), 0);
-        assertEq(module.fundsOf(MINER), LOCK);
-        _assertGate(MINER, true, 0, MIN_STAKE, LOCK);
+    /// @dev Frozen vs live, case 1: the backer unassigns matured stake in the
+    /// open challenge. It still counts (removingOf), so the gate admits, but
+    /// the live assigned stake is below L and settlement rejects the win
+    /// (`InsufficientFunds`) — nothing changes. The held stake is in the
+    /// backer's unassigned balance and is never locked. Topping the live
+    /// stake back up to L (a pending assign) makes the same wallet's win
+    /// settle; the lock then eats into the pending top-up, so the pending
+    /// buckets are clamped to the remaining balance.
+    function testRemovedStakeAdmitsButLiveStakeBelowLockReverts() public {
+        _qualify(ALICE, MINER, MIN_STAKE + LOCK - 1);
+        _unassign(ALICE, MINER, MIN_STAKE);
+        assertEq(module.assignedOf(MINER), LOCK - 1);
+        assertEq(module.removingOf(MINER), MIN_STAKE);
+        assertEq(module.heldStakeOf(ALICE), MIN_STAKE);
+        _assertEligibility(MINER, true, 0, MIN_STAKE + LOCK - 1);
 
-        _fund(MINER, 50e18);
-        vm.prank(MINER);
-        module.withdrawFunds(60e18); // 50 pending + 10 matured
-        assertEq(module.pendingFunds(MINER), 0);
-        _assertGate(MINER, false, 3, MIN_STAKE, LOCK - 10e18);
-
-        // Only the wallet's own funds: others have nothing to withdraw.
-        vm.prank(ALICE);
-        vm.expectRevert(abi.encodeWithSelector(PrefundedMiningPower.InsufficientFunds.selector, 0, 1));
-        module.withdrawFunds(1);
-        vm.prank(FUNDER);
-        vm.expectRevert(abi.encodeWithSelector(PrefundedMiningPower.InsufficientFunds.selector, 0, 1));
-        module.withdrawFunds(1);
-        vm.prank(MINER);
-        vm.expectRevert(abi.encodeWithSelector(PrefundedMiningPower.InsufficientFunds.selector, LOCK - 10e18, LOCK));
-        module.withdrawFunds(LOCK);
+        Snap memory s0 = _snap(MINER);
+        (uint256 nonce,) = _nonce(MINER);
+        vm.expectRevert(abi.encodeWithSelector(PrefundedMiningPower.InsufficientFunds.selector, LOCK - 1, LOCK));
+        _send(MINER, nonce);
+        _assertSnap(s0, MINER);
+        assertEq(module.heldStakeOf(ALICE), MIN_STAKE);
+        assertEq(module.unassignedOf(ALICE), MIN_STAKE);
         _assertBooks();
+
+        // One pending wei brings the live stake to L: the win settles.
+        _deposit(ALICE, 1);
+        _assign(ALICE, MINER, 1);
+        assertEq(module.pendingOf(MINER), 1);
+        _assertEligibility(MINER, true, 0, MIN_STAKE + LOCK - 1);
+        _win(MINER);
+        (,,,, address backer,) = module.committedOf(1);
+        assertEq(backer, ALICE);
+        assertEq(module.assignedOf(MINER), 0);
+        assertEq(module.assignedBy(ALICE), 0);
+        assertEq(module.pendingOf(MINER), 0);
+        assertEq(module.pendingBy(ALICE), 0);
+        assertEq(module.backerOf(MINER), address(0));
+        assertEq(module.assigneeOf(ALICE), address(0));
+        // The removal and the hold are untouched by the lock.
+        assertEq(module.removingOf(MINER), MIN_STAKE);
+        assertEq(module.heldBy(ALICE), MIN_STAKE);
+        assertEq(module.totalCommitted(), LOCK);
+        assertEq(module.totalStake(), MIN_STAKE);
+        _assertBooks();
+
+        // Next challenge: the hold lifts and MINER has nothing left.
+        _activate();
+        assertEq(module.withdrawableOf(ALICE), MIN_STAKE);
+        _assertEligibility(MINER, false, 2, 0);
+        _withdraw(ALICE, MIN_STAKE);
+        assertEq(token.balanceOf(ALICE), MIN_STAKE);
+        assertEq(token.balanceOf(address(module)), LOCK);
+        _assertBooks();
+    }
+
+    /// @dev Frozen vs live, case 2: after the same kind of mid-challenge
+    /// removal the live assigned stake is still >= L, so the admitted win
+    /// settles from it; the held stake stays with the backer.
+    function testRemovedStakeAdmitsAndLiveStakePaysLock() public {
+        _qualify(ALICE, MINER, MIN_STAKE + LOCK);
+        _unassign(ALICE, MINER, MIN_STAKE);
+        assertEq(module.assignedOf(MINER), LOCK);
+        _assertEligibility(MINER, true, 0, MIN_STAKE + LOCK);
+
+        uint256 tokenId = _win(MINER);
+        (, bytes32 d, uint256 c,) = nft.birthData(tokenId);
+        _assertLock(tokenId, MINER, c, d);
+        assertEq(module.assignedOf(MINER), 0);
+        assertEq(module.backerOf(MINER), address(0));
+        assertEq(module.unassignedOf(ALICE), MIN_STAKE);
+        assertEq(module.heldBy(ALICE), MIN_STAKE);
+        _assertBooks();
+
+        _activate();
+        _assertEligibility(MINER, false, 2, 0);
+        _withdraw(ALICE, MIN_STAKE);
+        assertEq(token.balanceOf(address(module)), LOCK);
+        assertEq(module.totalCommitted(), LOCK);
+        _assertBooks();
+    }
+
+    /// @notice LIMITATION (frozen vs live across backers): the gate admits
+    /// on the wallet's frozen stake, which still includes a previous backer's
+    /// matured stake unassigned this challenge, while the lock is paid from
+    /// whoever backs the wallet NOW. ALICE's removed MIN_STAKE qualifies
+    /// MINER; BOB, who backs the freed wallet mid-challenge with one lock's
+    /// worth (pending — it never counted for this challenge), pays the lock.
+    /// Nothing is lost to the module (the lock goes to the NFT's final
+    /// beneficiary on burn), but BOB is charged for a win his stake did not
+    /// qualify.
+    function testLimitation_NewBackerPaysWinAdmittedOnRemovedStake() public {
+        _qualify(ALICE, MINER, MIN_STAKE);
+        _unassign(ALICE, MINER, MIN_STAKE);
+        assertEq(module.backerOf(MINER), address(0));
+        _deposit(BOB, LOCK);
+        _assign(BOB, MINER, LOCK);
+        assertEq(module.pendingOf(MINER), LOCK);
+        _assertEligibility(MINER, true, 0, MIN_STAKE);
+
+        uint256 tokenId = _win(MINER);
+        (,,,, address backer,) = module.committedOf(tokenId);
+        assertEq(backer, BOB);
+        assertEq(module.assignedBy(BOB), 0);
+        assertEq(module.pendingOf(MINER), 0);
+        assertEq(module.backerOf(MINER), address(0));
+        assertEq(module.unassignedOf(ALICE), MIN_STAKE);
+        _assertBooks();
+    }
+
+    /// @notice LIMITATION (one funder per wallet): the backer slot is first
+    /// come, first served and the mining wallet has no way to evict a
+    /// backer. A 1-wei assignment by a stranger (CAROL) blocks the wallet's
+    /// intended backer for as long as CAROL keeps it there; it does not make
+    /// the wallet eligible (far below MIN_STAKE). The wallet has to mine
+    /// from another address.
+    function testLimitation_DustBackerSquatsWallet() public {
+        _deposit(CAROL, 1);
+        _assign(CAROL, MINER, 1);
+        _deposit(ALICE, MIN_STAKE);
+        vm.prank(ALICE);
+        vm.expectRevert(abi.encodeWithSelector(PrefundedMiningPower.WalletAlreadyBacked.selector, CAROL));
+        module.assign(MINER, MIN_STAKE);
+        _nextChallenge();
+        _activate();
+        _assertEligibility(MINER, false, 2, 1);
+        // Only CAROL can free the slot.
+        _unassign(CAROL, MINER, 1);
+        _assign(ALICE, MINER, MIN_STAKE);
+        assertEq(module.backerOf(MINER), ALICE);
+        _assertBooks();
+    }
+
+    function testSecondBackerRejected() public {
+        _deposit(ALICE, MIN_STAKE);
+        _assign(ALICE, MINER, MIN_STAKE / 2);
+        assertEq(module.backerOf(MINER), ALICE);
+        _deposit(BOB, MIN_STAKE);
+        vm.prank(BOB);
+        vm.expectRevert(abi.encodeWithSelector(PrefundedMiningPower.WalletAlreadyBacked.selector, ALICE));
+        module.assign(MINER, MIN_STAKE);
+
+        // The backer itself tops up freely; BOB backs another wallet.
+        _assign(ALICE, MINER, MIN_STAKE / 2);
+        _assign(BOB, MINER2, MIN_STAKE);
+        assertEq(module.assignedOf(MINER), MIN_STAKE);
+        assertEq(module.backerOf(MINER2), BOB);
+        _assertBooks();
+
+        // A partial exit keeps ALICE the backer; a full exit frees the slot.
+        _unassign(ALICE, MINER, 1);
+        assertEq(module.backerOf(MINER), ALICE);
+        _unassign(BOB, MINER2, MIN_STAKE);
+        vm.prank(BOB);
+        vm.expectRevert(abi.encodeWithSelector(PrefundedMiningPower.WalletAlreadyBacked.selector, ALICE));
+        module.assign(MINER, 1);
+        _unassign(ALICE, MINER, MIN_STAKE - 1);
+        assertEq(module.backerOf(MINER), address(0));
+        _assign(BOB, MINER, MIN_STAKE);
+        assertEq(module.backerOf(MINER), BOB);
+        assertEq(module.assignedOf(MINER), MIN_STAKE);
+        _assertBooks();
+
+        // The new backer's stake is what the next lock is paid from.
+        _nextChallenge();
+        uint256 tokenId = _win(MINER);
+        (,,,, address backer,) = module.committedOf(tokenId);
+        assertEq(backer, BOB);
+        assertEq(module.assignedBy(BOB), MIN_STAKE - LOCK);
+        assertEq(module.unassignedOf(ALICE), MIN_STAKE);
+        _assertBooks();
+    }
+
+    /// @dev With MIN_STAKE == L one win consumes the whole stake: the
+    /// wallet's backer slot and the backer's assignee are both cleared, so
+    /// another depositor may back the wallet and the old backer may back
+    /// another wallet without unassigning.
+    function testBackerClearedWhenStakeReachesZero() public {
+        _detach();
+        _deployModule(LOCK, LOCK, 0, 0, address(0));
+        _attach(module);
+        _qualify(ALICE, MINER, LOCK);
+        assertEq(module.backerOf(MINER), ALICE);
+        _win(MINER);
+        assertEq(module.assignedOf(MINER), 0);
+        assertEq(module.assignedBy(ALICE), 0);
+        assertEq(module.backerOf(MINER), address(0));
+        assertEq(module.assigneeOf(ALICE), address(0));
+        assertEq(module.totalAssigned(), 0);
+        assertEq(module.totalStake(), 0);
+        assertEq(module.totalCommitted(), LOCK);
+        _assertBooks();
+
+        _deposit(BOB, LOCK);
+        _assign(BOB, MINER, LOCK);
+        _deposit(ALICE, LOCK);
+        _assign(ALICE, MINER2, LOCK);
+        assertEq(module.backerOf(MINER), BOB);
+        assertEq(module.backerOf(MINER2), ALICE);
+        vm.prank(ALICE);
+        vm.expectRevert(abi.encodeWithSelector(PrefundedMiningPower.WrongAssignee.selector, MINER2, MINER));
+        module.unassign(MINER, 1);
+        _assertBooks();
+    }
+
+    function testMinStakeBelowLockRejectedByConstructor() public {
+        vm.expectRevert(PrefundedMiningPower.InvalidConfiguration.selector);
+        new PrefundedMiningPower(address(token), address(core), LOCK - 1, LOCK, 0, 0, address(0));
+        vm.expectRevert(PrefundedMiningPower.InvalidConfiguration.selector);
+        new PrefundedMiningPower(address(token), address(core), 0, LOCK, 0, 0, address(0));
+        vm.expectRevert(PrefundedMiningPower.InvalidConfiguration.selector);
+        new PrefundedMiningPower(address(token), address(core), 0, 0, 0, 0, address(0));
+        PrefundedMiningPower equal =
+            new PrefundedMiningPower(address(token), address(core), LOCK, LOCK, 0, 0, address(0));
+        assertEq(equal.MIN_STAKE(), equal.LOCK_PER_MINT());
     }
 
     // -- rollback matrix: a lock never survives a reverted submission --------
 
     function testInvalidDigestRollsBack() public {
-        _qualifyAndFund(ALICE, MINER, MIN_STAKE, LOCK);
+        _qualify(ALICE, MINER, MIN_STAKE);
         uint256 target = core.currentTarget();
         (uint256 bad, bytes32 badDigest) = _invalidNonce(MINER, target);
         Snap memory s0 = _snap(MINER);
@@ -995,13 +1177,13 @@ contract PrefundedMiningPowerSettlementTest is PrefundedMiningStack {
 
         // The same wallet still mints (and locks) with a valid digest.
         _win(MINER);
-        (uint256 amount,,,,) = module.committedOf(1);
+        (uint256 amount,,,,,) = module.committedOf(1);
         assertEq(amount, LOCK);
         _assertBooks();
     }
 
     function testStaleIdSeedWaitingExpiredRejected() public {
-        _qualifyAndFund(ALICE, MINER, MIN_STAKE, LOCK);
+        _qualify(ALICE, MINER, MIN_STAKE);
         (uint256 nonce,) = _nonce(MINER);
         Snap memory s0 = _snap(MINER);
 
@@ -1036,7 +1218,8 @@ contract PrefundedMiningPowerSettlementTest is PrefundedMiningStack {
             )
         );
         core.submitProof(newId, newSeed, nonce, basket);
-        assertEq(module.fundsOf(MINER), s0.funds);
+        assertEq(module.assignedOf(MINER), s0.walletStake);
+        assertEq(module.totalStake(), s0.totalStake);
         assertEq(module.totalCommitted(), 0);
         assertEq(nft.mintedEver(), 0);
         _assertNoLock(1);
@@ -1045,7 +1228,7 @@ contract PrefundedMiningPowerSettlementTest is PrefundedMiningStack {
     }
 
     function testBadBasketRollsBackLock() public {
-        _qualifyAndFund(ALICE, MINER, MIN_STAKE, LOCK);
+        _qualify(ALICE, MINER, MIN_STAKE);
         (uint256 nonce,) = _nonce(MINER);
         Snap memory s0 = _snap(MINER);
         address unadmitted = address(0xBA5CE7);
@@ -1055,7 +1238,7 @@ contract PrefundedMiningPowerSettlementTest is PrefundedMiningStack {
         _assertSnap(s0, MINER);
 
         _send(MINER, nonce);
-        (uint256 amount,,, address lockMiner,) = module.committedOf(1);
+        (uint256 amount,,, address lockMiner,,) = module.committedOf(1);
         assertEq(amount, LOCK);
         assertEq(lockMiner, MINER);
         _assertBooks();
@@ -1086,25 +1269,20 @@ contract PrefundedMiningPowerSettlementTest is PrefundedMiningStack {
         c2.setMiningPower(m);
 
         token.mint(ALICE, MIN_STAKE);
-        token.mint(FUNDER, LOCK);
         vm.startPrank(ALICE);
         token.approve(address(m), MIN_STAKE);
         m.deposit(MIN_STAKE);
         m.assign(MINER, MIN_STAKE);
         vm.stopPrank();
-        vm.startPrank(FUNDER);
-        token.approve(address(m), LOCK);
-        m.fund(MINER, LOCK);
-        vm.stopPrank();
 
-        // Open the next challenge (stake and funds mature) and make it active.
+        // Open the next challenge (stake matures) and make it active.
         vm.roll(c2.activeSeedParentBlock() + c2.SEED_READABLE_PARENT_BLOCKS() + 1);
         c2.refreshExpiredSeed();
         uint256 id = c2.activeChallengeId();
         uint256 sb = c2.activeSeedParentBlock();
         vm.roll(sb + 1);
         vm.setBlockhash(sb, keccak256(abi.encode("seed2", sb)));
-        (bool eligible,,,) = m.eligibilityOf(MINER);
+        (bool eligible,,) = m.eligibilityOf(MINER);
         assertTrue(eligible);
         uint256 nonce;
         {
@@ -1117,10 +1295,12 @@ contract PrefundedMiningPowerSettlementTest is PrefundedMiningStack {
         vm.prank(MINER);
         vm.expectRevert(bytes("hook failed"));
         c2.submitProof(id, sb, nonce, basket);
-        assertEq(m.fundsOf(MINER), LOCK);
-        assertEq(m.totalFunds(), LOCK);
+        assertEq(m.assignedOf(MINER), MIN_STAKE);
+        assertEq(m.assignedBy(ALICE), MIN_STAKE);
+        assertEq(m.totalStake(), MIN_STAKE);
+        assertEq(m.totalAssigned(), MIN_STAKE);
         assertEq(m.totalCommitted(), 0);
-        (uint256 amount,,,,) = m.committedOf(1);
+        (uint256 amount,,,,,) = m.committedOf(1);
         assertEq(amount, 0);
         (uint256 note, address noteMiner) = m.pendingEligibleNote();
         assertEq(note, 0);
@@ -1129,24 +1309,23 @@ contract PrefundedMiningPowerSettlementTest is PrefundedMiningStack {
         assertEq(c2.nftsMintedEver(), 0);
         assertEq(n2.mintedEver(), 0);
         assertEq(m.lastAcceptedProofs(), 0);
-        assertEq(token.balanceOf(address(m)), MIN_STAKE + LOCK);
+        assertEq(token.balanceOf(address(m)), MIN_STAKE);
 
         fixture.setFail(false);
         vm.prank(MINER);
         c2.submitProof(id, sb, nonce, basket);
-        (amount,,,,) = m.committedOf(1);
+        (amount,,,,,) = m.committedOf(1);
         assertEq(amount, LOCK);
-        assertEq(m.fundsOf(MINER), 0);
+        assertEq(m.assignedOf(MINER), MIN_STAKE - LOCK);
         assertEq(n2.ownerOf(1), MINER);
     }
 
     function testCopiedNonceOtherWalletNoLock() public {
         _deposit(BOB, MIN_STAKE);
         _assign(BOB, MINER2, MIN_STAKE);
-        _fund(MINER2, LOCK);
-        _qualifyAndFund(ALICE, MINER, MIN_STAKE, LOCK);
+        _qualify(ALICE, MINER, MIN_STAKE);
         // Both wallets are eligible; the proof is wallet-bound.
-        _assertGate(MINER2, true, 0, MIN_STAKE, LOCK);
+        _assertEligibility(MINER2, true, 0, MIN_STAKE);
         bytes32 challenge = core.currentChallenge();
         uint256 target = core.currentTarget();
         uint256 nonce;
@@ -1162,14 +1341,16 @@ contract PrefundedMiningPowerSettlementTest is PrefundedMiningStack {
         vm.expectRevert(abi.encodeWithSelector(HunterMiningCore.InvalidProof.selector, copied, target));
         _send(MINER2, nonce);
         _assertSnap(s2, MINER2);
-        assertEq(module.fundsOf(MINER), LOCK);
+        assertEq(module.assignedOf(MINER), MIN_STAKE);
 
         _send(MINER, nonce);
-        (uint256 amount,,, address lockMiner,) = module.committedOf(1);
+        (uint256 amount,,, address lockMiner, address lockBacker,) = module.committedOf(1);
         assertEq(amount, LOCK);
         assertEq(lockMiner, MINER);
-        assertEq(module.fundsOf(MINER), 0);
-        assertEq(module.fundsOf(MINER2), LOCK);
+        assertEq(lockBacker, ALICE);
+        assertEq(module.assignedOf(MINER), MIN_STAKE - LOCK);
+        assertEq(module.assignedOf(MINER2), MIN_STAKE);
+        assertEq(module.assignedBy(BOB), MIN_STAKE);
         _assertBooks();
     }
 
@@ -1183,14 +1364,11 @@ contract PrefundedMiningPowerSettlementTest is PrefundedMiningStack {
         assertEq(core.acceptedProofs(), 2);
 
         _deployModule(MIN_STAKE, LOCK, 0, 0, address(0));
-        _fund(MINER, LOCK);
-        _fund(BOB, LOCK);
-        uint256 funds = module.totalFunds();
+        _deposit(ALICE, MIN_STAKE);
         _attach(module);
         assertEq(module.lastAcceptedProofs(), 2);
         assertEq(module.totalCommitted(), 0);
-        assertEq(module.totalFunds(), funds);
-        assertEq(module.fundsOf(BOB), LOCK);
+        assertEq(module.totalStake(), MIN_STAKE);
         for (uint256 t = 1; t <= 3; t++) {
             _assertNoLock(t);
         }
@@ -1198,7 +1376,6 @@ contract PrefundedMiningPowerSettlementTest is PrefundedMiningStack {
         _assertBooks();
 
         // The first real win after attach is the first lock.
-        _deposit(ALICE, MIN_STAKE);
         _assign(ALICE, MINER, MIN_STAKE);
         _nextChallenge();
         uint256 tokenId = _win(MINER);
@@ -1212,34 +1389,36 @@ contract PrefundedMiningPowerSettlementTest is PrefundedMiningStack {
     function testLockBindsToMintedIdDigestChallenge() public {
         _deposit(BOB, MIN_STAKE);
         _assign(BOB, MINER2, MIN_STAKE);
-        _fund(MINER2, LOCK);
-        _qualifyAndFund(ALICE, MINER, MIN_STAKE, 2 * LOCK);
+        _qualifyFor(ALICE, MINER, 2);
         address[3] memory winners = [MINER, MINER2, MINER];
+        address[3] memory backers = [ALICE, BOB, ALICE];
         for (uint256 i = 0; i < 3; i++) {
             uint256 tokenId = _win(winners[i]);
             assertEq(tokenId, i + 1);
             (, bytes32 d, uint256 c,) = nft.birthData(tokenId);
             _assertLock(tokenId, nft.ownerOf(tokenId), c, d);
             assertEq(nft.ownerOf(tokenId), winners[i]);
+            (,,,, address backer,) = module.committedOf(tokenId);
+            assertEq(backer, backers[i]);
         }
         // Distinct challenges and digests per lock.
-        (, uint256 c1, bytes32 d1,,) = module.committedOf(1);
-        (, uint256 c3, bytes32 d3,,) = module.committedOf(3);
+        (, uint256 c1, bytes32 d1,,,) = module.committedOf(1);
+        (, uint256 c3, bytes32 d3,,,) = module.committedOf(3);
         assertTrue(c1 != c3);
         assertTrue(d1 != d3);
         // The lock records the minter, not whoever holds the NFT later.
         vm.prank(MINER);
         nft.transferFrom(MINER, CAROL, 1);
-        (,,, address lockMiner,) = module.committedOf(1);
+        (,,, address lockMiner,,) = module.committedOf(1);
         assertEq(lockMiner, MINER);
         assertEq(module.totalCommitted(), 3 * LOCK);
-        assertEq(module.fundsOf(MINER), 0);
-        assertEq(module.fundsOf(MINER2), 0);
+        assertEq(module.assignedOf(MINER), MIN_STAKE - LOCK);
+        assertEq(module.assignedOf(MINER2), MIN_STAKE - LOCK);
         _assertBooks();
     }
 
     function testCounterDivergenceFailsClosed() public {
-        _qualifyAndFund(ALICE, MINER, MIN_STAKE, LOCK);
+        _qualify(ALICE, MINER, MIN_STAKE);
         stdstore.target(address(nft)).sig("mintedEver()").checked_write(1);
         (uint256 nonce,) = _nonce(MINER);
         // Core counter becomes 1; NFT would mint id 2.
@@ -1248,7 +1427,7 @@ contract PrefundedMiningPowerSettlementTest is PrefundedMiningStack {
         core.submitProof(cid, seed, nonce, basket);
         _assertNoLock(1);
         _assertNoLock(2);
-        assertEq(module.fundsOf(MINER), LOCK);
+        assertEq(module.assignedOf(MINER), MIN_STAKE);
         assertEq(module.totalCommitted(), 0);
         assertEq(core.acceptedProofs(), 0);
         assertEq(core.nftsMintedEver(), 0);
@@ -1259,21 +1438,21 @@ contract PrefundedMiningPowerSettlementTest is PrefundedMiningStack {
         core.tripMining();
         assertTrue(core.miningStopped());
         assertTrue(module.retired());
-        // Nothing to mint any more: no new funding, but funds exit freely.
-        vm.prank(FUNDER);
+        // Nothing to mint any more: no new assigns, but stake exits freely.
+        vm.prank(ALICE);
         vm.expectRevert(PrefundedMiningPower.Retired.selector);
-        module.fund(MINER, 1);
-        vm.prank(MINER);
-        module.withdrawFunds(LOCK);
-        assertEq(token.balanceOf(MINER), LOCK);
-        assertEq(module.totalFunds(), 0);
+        module.assign(MINER, 1);
+        _unassign(ALICE, MINER, MIN_STAKE);
+        _withdraw(ALICE, MIN_STAKE);
+        assertEq(token.balanceOf(ALICE), MIN_STAKE);
+        assertEq(module.totalStake(), 0);
     }
 
     /// @dev Both counters rewound in lockstep (stdstore on the core and the
     /// NFT) pass the counter check but point at an id that already carries
     /// a lock: settlement refuses to overwrite it, before the NFT mint.
     function testExistingLockNeverOverwritten() public {
-        _qualifyAndFund(ALICE, MINER, MIN_STAKE, 2 * LOCK);
+        _qualifyFor(ALICE, MINER, 2);
         uint256 tokenId = _win(MINER);
         (, bytes32 d, uint256 c,) = nft.birthData(tokenId);
         stdstore.target(address(core)).sig("nftsMintedEver()").checked_write(uint256(0));
@@ -1284,7 +1463,7 @@ contract PrefundedMiningPowerSettlementTest is PrefundedMiningStack {
         vm.expectRevert(abi.encodeWithSelector(PrefundedMiningPower.LockAlreadyExists.selector, tokenId));
         core.submitProof(cid, seed, nonce, basket);
         _assertLock(tokenId, MINER, c, d);
-        assertEq(module.fundsOf(MINER), LOCK);
+        assertEq(module.assignedOf(MINER), MIN_STAKE);
         assertEq(module.totalCommitted(), LOCK);
         _assertNoteEmpty();
     }
@@ -1292,46 +1471,79 @@ contract PrefundedMiningPowerSettlementTest is PrefundedMiningStack {
     /// @dev Unit probes on SEPARATE modules bound to a stand-in core (see
     /// `ForeignSequenceCore`): the defensive settlement checks the real core
     /// can never trigger still fail closed — a note for another challenge
-    /// (`StaleChallengeId`), funds gone between gate and settlement
-    /// (`InsufficientFunds`) and a gate for challenge 0 (`ChallengeNotOpen`).
+    /// (`StaleChallengeId`), stake pulled between gate and settlement
+    /// (`InsufficientFunds`), a second win in the SAME challenge whose cached
+    /// frozen stake still admits it while the live stake cannot pay
+    /// (`InsufficientFunds`), and a gate for challenge 0 (`ChallengeNotOpen`).
     function testSettlementFailsClosedOnForeignSequence() public {
         ForeignSequenceCore fc;
         PrefundedMiningPower m;
 
-        (fc, m) = _foreignModule();
-        bytes memory err = fc.gateThenAccept(m, 7, 8);
+        (fc, m) = _foreignModule(LOCK);
+        bytes memory err = fc.gateThenAccept(m, 7, 8, MINER);
         assertEq(err, abi.encodeWithSelector(PrefundedMiningPower.StaleChallengeId.selector, 7, 8));
-        (uint256 amount,,,,) = m.committedOf(1);
+        (uint256 amount,,,,,) = m.committedOf(1);
         assertEq(amount, 0);
-        assertEq(m.fundsOf(address(fc)), LOCK);
+        assertEq(m.assignedOf(MINER), LOCK);
 
-        (fc, m) = _foreignModule();
-        err = fc.gateWithdrawThenAccept(m, 7);
+        // Stake pulled (all, then all but one wei) between gate and settlement.
+        (fc, m) = _foreignModule(LOCK);
+        err = fc.gateUnassignThenAccept(m, 7, MINER, LOCK);
         assertEq(err, abi.encodeWithSelector(PrefundedMiningPower.InsufficientFunds.selector, 0, LOCK));
-        (amount,,,,) = m.committedOf(1);
+        (amount,,,,,) = m.committedOf(1);
         assertEq(amount, 0);
         assertEq(m.totalCommitted(), 0);
+        (fc, m) = _foreignModule(LOCK);
+        err = fc.gateUnassignThenAccept(m, 7, MINER, 1);
+        assertEq(err, abi.encodeWithSelector(PrefundedMiningPower.InsufficientFunds.selector, LOCK - 1, LOCK));
+        assertEq(m.totalCommitted(), 0);
+
+        // Same challenge twice: the frozen value (LOCK) still admits, the
+        // first lock took the whole live stake, the second cannot be paid.
+        (fc, m) = _foreignModule(LOCK);
+        err = fc.gateThenAccept(m, 7, 7, MINER);
+        assertEq(err.length, 0);
+        assertEq(m.assignedOf(MINER), 0);
+        err = fc.acceptAgainSameChallenge(m, MINER);
+        assertEq(err, abi.encodeWithSelector(PrefundedMiningPower.InsufficientFunds.selector, 0, LOCK));
+        (amount,,,,,) = m.committedOf(2);
+        assertEq(amount, 0);
+        assertEq(m.totalCommitted(), LOCK);
+        // With two locks' worth of live stake the same sequence pays both
+        // (within one challenge a wallet's frozen stake is not changed by
+        // its own wins).
+        (fc, m) = _foreignModule(2 * LOCK);
+        fc.gateThenAccept(m, 7, 7, MINER);
+        err = fc.acceptAgainSameChallenge(m, MINER);
+        assertEq(err.length, 0);
+        (amount,,,,,) = m.committedOf(2);
+        assertEq(amount, LOCK);
+        assertEq(m.assignedOf(MINER), 0);
+        assertEq(m.totalCommitted(), 2 * LOCK);
 
         fc = new ForeignSequenceCore();
-        m = new PrefundedMiningPower(address(token), address(fc), 0, LOCK, 0, 0, address(0));
+        m = new PrefundedMiningPower(address(token), address(fc), LOCK, LOCK, 0, 0, address(0));
         token.mint(address(fc), LOCK);
-        err = fc.gateChallengeZero(m, IERC20(address(token)), 5);
+        err = fc.gateChallengeZero(m, IERC20(address(token)), 5, MINER);
         assertEq(err, abi.encodeWithSelector(PrefundedMiningPower.ChallengeNotOpen.selector, 0));
 
         // The honest order on the same stand-in settles token 1.
-        (fc, m) = _foreignModule();
-        err = fc.gateThenAccept(m, 7, 7);
+        (fc, m) = _foreignModule(LOCK);
+        err = fc.gateThenAccept(m, 7, 7, MINER);
         assertEq(err.length, 0);
-        (uint256 a, uint256 c, bytes32 d, address who,) = m.committedOf(1);
+        (uint256 a, uint256 c, bytes32 d, address who, address backer,) = m.committedOf(1);
         assertEq(a, LOCK);
         assertEq(c, 7);
         assertEq(d, keccak256("foreign digest"));
-        assertEq(who, address(fc));
+        assertEq(who, MINER);
+        assertEq(backer, address(fc));
+        assertEq(m.totalStake(), 0);
+        assertEq(token.balanceOf(address(m)), LOCK);
     }
 
     function testSecondSubmitInSameTxCannotSettle() public {
         DoubleSubmitMiner dm = new DoubleSubmitMiner();
-        _qualifyAndFund(ALICE, address(dm), MIN_STAKE, 3 * LOCK);
+        _qualifyFor(ALICE, address(dm), 3);
         (uint256 nonce,) = _nonce(address(dm));
         uint256 id = cid;
         dm.run(core, module, id, seed, nonce, basket);
@@ -1357,14 +1569,14 @@ contract PrefundedMiningPowerSettlementTest is PrefundedMiningStack {
         (, bytes32 d, uint256 c,) = nft.birthData(1);
         _assertLock(1, address(dm), c, d);
         _assertNoLock(2);
-        assertEq(module.fundsOf(address(dm)), 2 * LOCK);
+        assertEq(module.assignedOf(address(dm)), MIN_STAKE + LOCK);
         assertEq(module.totalCommitted(), LOCK);
         _assertNoteEmpty();
         _assertBooks();
     }
 
     function testReplayAfterAcceptanceNoSecondLock() public {
-        _qualifyAndFund(ALICE, MINER, MIN_STAKE, 3 * LOCK);
+        _qualifyFor(ALICE, MINER, 3);
         uint256 id = cid;
         uint256 sb = seed;
         (uint256 nonce,) = _nonce(MINER);
@@ -1387,7 +1599,7 @@ contract PrefundedMiningPowerSettlementTest is PrefundedMiningStack {
         assertEq(nft.mintedEver(), 1);
         _assertNoLock(2);
         assertEq(module.totalCommitted(), LOCK);
-        assertEq(module.fundsOf(MINER), 2 * LOCK);
+        assertEq(module.assignedOf(MINER), MIN_STAKE + LOCK);
         _assertNoteEmpty();
         _assertBooks();
     }
@@ -1396,28 +1608,30 @@ contract PrefundedMiningPowerSettlementTest is PrefundedMiningStack {
     /// digest just above the base target is rejected at the base target even
     /// for an eligible wallet with an enormous stake.
     function testCurveDisabledGateNeverWidensTarget() public {
-        _qualifyAndFund(ALICE, MINER, 1e30, LOCK);
+        _qualify(ALICE, MINER, 1e30);
         uint256 base = core.currentTarget();
         (uint256 n, bytes32 d) = _bandNonce(MINER, base, _widen(base, 3e18));
         vm.prank(MINER);
         vm.expectRevert(abi.encodeWithSelector(HunterMiningCore.InvalidProof.selector, d, base));
         core.submitProof(cid, seed, n, basket);
         assertEq(module.totalCommitted(), 0);
+        assertEq(module.assignedOf(MINER), 1e30);
     }
 
     /// @dev The settlement hook is O(1): gas of a winning submission is flat
-    /// in the number of depositors and funded wallets. Every scenario starts
-    /// from the same state snapshot and runs the same core schedule, so only
-    /// the module's unrelated population differs. Also logs the overhead of
-    /// the module over the ungated `DummyMiningPower` on the same core.
+    /// in the number of depositors, whether they back other wallets or only
+    /// hold unassigned stake. Every scenario starts from the same state
+    /// snapshot and runs the same core schedule, so only the module's
+    /// unrelated population differs. Also logs the overhead of the module
+    /// over the ungated `DummyMiningPower` on the same core.
     function testHookGasFlatInDepositorCount() public {
         uint256 base = vm.snapshotState();
 
         uint256 g1 = _measuredWin(0, 0);
         vm.revertToState(base);
-        uint256 gDepositors = _measuredWin(200, 0);
+        uint256 gBacking = _measuredWin(200, 0);
         vm.revertToState(base);
-        uint256 gFunded = _measuredWin(0, 200);
+        uint256 gIdle = _measuredWin(0, 200);
         vm.revertToState(base);
 
         // Same schedule with the ungated dummy module on the same core.
@@ -1433,23 +1647,79 @@ contract PrefundedMiningPowerSettlementTest is PrefundedMiningStack {
         uint256 gDummy = before - gasleft();
 
         emit log_named_uint("win gas, 1 depositor", g1);
-        emit log_named_uint("win gas, +200 depositors backing other wallets", gDepositors);
-        emit log_named_uint("win gas, +200 funded wallets", gFunded);
+        emit log_named_uint("win gas, +200 depositors backing other wallets", gBacking);
+        emit log_named_uint("win gas, +200 depositors with unassigned stake", gIdle);
         emit log_named_uint("win gas, DummyMiningPower", gDummy);
         emit log_named_uint("module overhead over dummy", g1 - gDummy);
-        assertLt(_diff(g1, gDepositors) * 100, g1 * 5, "depositor count moved hook gas");
-        assertLt(_diff(g1, gFunded) * 100, g1 * 5, "funded wallet count moved hook gas");
+        assertLt(_diff(g1, gBacking) * 100, g1 * 5, "backing depositor count moved hook gas");
+        assertLt(_diff(g1, gIdle) * 100, g1 * 5, "idle depositor count moved hook gas");
+    }
+
+    /// @dev Random single-wallet sequences (one backer, deposits, top-ups,
+    /// unassigns, wins and snapshots): after every action the harness books
+    /// hold — in particular `pendingOf <= assignedOf` and
+    /// `pendingBy <= assignedBy`, however a lock lands on pending stake —
+    /// and every win outcome matches the frozen/live rule.
+    /// forge-config: default.fuzz.runs = 64
+    /// forge-config: release.fuzz.runs = 64
+    function testFuzz_LockKeepsPendingWithinBalance(uint256 fuzzSeed) public {
+        _deposit(ALICE, 1);
+        _assign(ALICE, MINER, 1);
+        uint256 wins;
+        for (uint256 i = 0; i < 32; i++) {
+            uint256 r = uint256(keccak256(abi.encode(fuzzSeed, i)));
+            uint256 op = r % 5;
+            uint256 amt = ((r >> 8) % (MIN_STAKE / 2)) + 1;
+            if (op == 0) {
+                // Top-up (pending for the open challenge).
+                _deposit(ALICE, amt);
+                if (module.assigneeOf(ALICE) == address(0) || module.assigneeOf(ALICE) == MINER) {
+                    _assign(ALICE, MINER, amt);
+                }
+            } else if (op == 1) {
+                uint256 assigned = module.assignedBy(ALICE);
+                if (assigned != 0) _unassign(ALICE, MINER, (amt % assigned) + 1);
+            } else if (op == 2) {
+                _nextChallenge();
+            } else {
+                _activate();
+                (bool eligible,, uint256 frozen) = module.eligibilityOf(MINER);
+                uint256 live = module.assignedOf(MINER);
+                (uint256 nonce,) = _nonce(MINER);
+                if (!eligible) {
+                    _expectNotEligible(2);
+                    _send(MINER, nonce);
+                } else if (live < LOCK) {
+                    assertGe(frozen, MIN_STAKE);
+                    vm.expectRevert(
+                        abi.encodeWithSelector(PrefundedMiningPower.InsufficientFunds.selector, live, LOCK)
+                    );
+                    _send(MINER, nonce);
+                } else {
+                    _send(MINER, nonce);
+                    wins++;
+                    assertEq(module.assignedOf(MINER), live - LOCK);
+                }
+            }
+            _assertBooks();
+        }
+        assertEq(module.totalCommitted(), wins * LOCK);
+        assertEq(nft.mintedEver(), wins);
     }
 
     // ------------------------------------------------------------------
     // Helpers
     // ------------------------------------------------------------------
 
-    /// @dev Money, note and counter state a rejected submission must not move.
+    /// @dev Stake, lock, note and counter state a rejected submission must
+    /// not move.
     struct Snap {
-        uint256 funds;
+        uint256 walletStake;
+        address backer;
+        uint256 backerStake;
         uint256 pending;
-        uint256 totalFunds;
+        uint256 totalStake;
+        uint256 totalAssigned;
         uint256 totalCommitted;
         uint256 moduleBal;
         uint256 accepted;
@@ -1461,9 +1731,12 @@ contract PrefundedMiningPowerSettlementTest is PrefundedMiningStack {
     }
 
     function _snap(address wallet) private view returns (Snap memory s) {
-        s.funds = module.fundsOf(wallet);
-        s.pending = module.pendingFunds(wallet);
-        s.totalFunds = module.totalFunds();
+        s.walletStake = module.assignedOf(wallet);
+        s.backer = module.backerOf(wallet);
+        s.backerStake = s.backer == address(0) ? 0 : module.assignedBy(s.backer);
+        s.pending = module.pendingOf(wallet);
+        s.totalStake = module.totalStake();
+        s.totalAssigned = module.totalAssigned();
         s.totalCommitted = module.totalCommitted();
         s.moduleBal = token.balanceOf(address(module));
         s.accepted = core.acceptedProofs();
@@ -1475,9 +1748,12 @@ contract PrefundedMiningPowerSettlementTest is PrefundedMiningStack {
     }
 
     function _assertSnap(Snap memory s, address wallet) private view {
-        assertEq(module.fundsOf(wallet), s.funds, "fundsOf moved");
-        assertEq(module.pendingFunds(wallet), s.pending, "pendingFunds moved");
-        assertEq(module.totalFunds(), s.totalFunds, "totalFunds moved");
+        assertEq(module.assignedOf(wallet), s.walletStake, "assignedOf moved");
+        assertEq(module.backerOf(wallet), s.backer, "backerOf moved");
+        if (s.backer != address(0)) assertEq(module.assignedBy(s.backer), s.backerStake, "assignedBy moved");
+        assertEq(module.pendingOf(wallet), s.pending, "pendingOf moved");
+        assertEq(module.totalStake(), s.totalStake, "totalStake moved");
+        assertEq(module.totalAssigned(), s.totalAssigned, "totalAssigned moved");
         assertEq(module.totalCommitted(), s.totalCommitted, "totalCommitted moved");
         assertEq(token.balanceOf(address(module)), s.moduleBal, "module balance moved");
         assertEq(core.acceptedProofs(), s.accepted, "acceptedProofs moved");
@@ -1490,31 +1766,26 @@ contract PrefundedMiningPowerSettlementTest is PrefundedMiningStack {
         _assertNoteEmpty();
     }
 
+    /// @dev Checks amount, challenge, digest, miner and released; the backer
+    /// is checked where a test knows it.
     function _assertLock(uint256 tokenId, address miner, uint256 challengeId, bytes32 digest) private view {
-        (uint256 amount, uint256 c, bytes32 d, address m, bool released) = module.committedOf(tokenId);
+        (uint256 amount, uint256 c, bytes32 d, address m, address b, bool released) = module.committedOf(tokenId);
         assertEq(amount, LOCK, "lock amount");
         assertEq(c, challengeId, "lock challenge");
         assertEq(d, digest, "lock digest");
         assertEq(m, miner, "lock miner");
+        assertTrue(b != address(0), "lock without backer");
         assertFalse(released, "lock released");
     }
 
     function _assertNoLock(uint256 tokenId) private view {
-        (uint256 amount, uint256 c, bytes32 d, address m, bool released) = module.committedOf(tokenId);
+        (uint256 amount, uint256 c, bytes32 d, address m, address b, bool released) = module.committedOf(tokenId);
         assertEq(amount, 0, "unexpected lock");
         assertEq(c, 0);
         assertEq(d, bytes32(0));
         assertEq(m, address(0));
+        assertEq(b, address(0));
         assertFalse(released);
-    }
-
-    function _assertGate(address wallet, bool eligible, uint8 reason, uint256 stake, uint256 funds) private view {
-        (bool e, uint8 r, uint256 s, uint256 f) = module.eligibilityOf(wallet);
-        assertEq(e, eligible, "eligible");
-        assertEq(r, reason, "reason");
-        assertEq(s, stake, "stake");
-        assertEq(f, funds, "funds");
-        assertEq(module.eligibleFundsOf(wallet), funds, "eligibleFundsOf");
     }
 
     /// @dev A valid-digest submission from `wallet` reverts
@@ -1537,21 +1808,21 @@ contract PrefundedMiningPowerSettlementTest is PrefundedMiningStack {
         revert("invalid nonce not found");
     }
 
-    /// @dev Populates the module with `depositors` extra depositors (each
-    /// backing its own other wallet) and `funded` extra funded wallets,
-    /// qualifies and funds MINER, then measures MINER's winning submission.
-    function _measuredWin(uint256 depositors, uint256 funded) private returns (uint256 used) {
-        for (uint256 i = 0; i < depositors; i++) {
+    /// @dev Populates the module with `backing` extra depositors (each
+    /// backing its own other wallet) and `idle` extra depositors holding
+    /// unassigned stake, qualifies MINER, then measures its winning
+    /// submission.
+    function _measuredWin(uint256 backing, uint256 idle) private returns (uint256 used) {
+        for (uint256 i = 0; i < backing; i++) {
             address d = address(uint160(0xD0000 + i));
             _deposit(d, MIN_STAKE);
             _assign(d, address(uint160(0xE0000 + i)), MIN_STAKE);
         }
-        for (uint256 i = 0; i < funded; i++) {
-            _fund(address(uint160(0xF0000 + i)), LOCK);
+        for (uint256 i = 0; i < idle; i++) {
+            _deposit(address(uint160(0xF0000 + i)), MIN_STAKE);
         }
         _deposit(ALICE, MIN_STAKE);
         _assign(ALICE, MINER, MIN_STAKE);
-        _fund(MINER, LOCK);
         _nextChallenge();
         _activate();
         (uint256 nonce,) = _nonce(MINER);
@@ -1559,17 +1830,17 @@ contract PrefundedMiningPowerSettlementTest is PrefundedMiningStack {
         uint256 before = gasleft();
         core.submitProof(cid, seed, nonce, basket);
         used = before - gasleft();
-        (uint256 amount,,,,) = module.committedOf(1);
+        (uint256 amount,,,,,) = module.committedOf(1);
         assertEq(amount, LOCK);
     }
 
-    /// @dev A stand-in core with its own MIN_STAKE-0 module, funded with
-    /// LOCK before its first snapshot so the funds count there.
-    function _foreignModule() private returns (ForeignSequenceCore fc, PrefundedMiningPower m) {
+    /// @dev A stand-in core with its own MIN_STAKE = LOCK module; the core
+    /// itself stakes `stake` for MINER in challenge 6, so it counts from 7.
+    function _foreignModule(uint256 stake) private returns (ForeignSequenceCore fc, PrefundedMiningPower m) {
         fc = new ForeignSequenceCore();
-        m = new PrefundedMiningPower(address(token), address(fc), 0, LOCK, 0, 0, address(0));
-        token.mint(address(fc), LOCK);
-        fc.approveAndFund(m, IERC20(address(token)), LOCK);
+        m = new PrefundedMiningPower(address(token), address(fc), LOCK, LOCK, 0, 0, address(0));
+        token.mint(address(fc), stake);
+        fc.openAndStake(m, IERC20(address(token)), 6, MINER, stake);
     }
 
     function _diff(uint256 a, uint256 b) private pure returns (uint256) {
@@ -1587,40 +1858,27 @@ contract PrefundedMiningPowerSettlementTest is PrefundedMiningStack {
     }
 
     function _assertEligibility(address wallet, bool eligible, uint8 reason, uint256 stake) private view {
-        (bool e, uint8 r, uint256 s, uint256 f) = module.eligibilityOf(wallet);
+        (bool e, uint8 r, uint256 s) = module.eligibilityOf(wallet);
         assertEq(e, eligible, "eligible");
         assertEq(r, reason, "reason");
         assertEq(s, stake, "stake");
-        // S6: `funds` is the wallet's eligible (non-pending) mint funds.
-        assertEq(f, module.eligibleFundsOf(wallet), "funds");
     }
 
     /// @dev A valid-digest submission from `miner` reverts NotEligible(2) and
     /// changes nothing in the core, NFT or module.
     function _assertGateRejectsWithoutSideEffects(address miner) private {
-        uint256 accepted = core.acceptedProofs();
-        uint256 coreMinted = core.nftsMintedEver();
-        uint256 nftMinted = nft.mintedEver();
-        bytes32 prevDigest = core.previousAcceptedDigest();
-        uint256 activeId = core.activeChallengeId();
-        uint256 lastAccepted = module.lastAcceptedProofs();
-        (bool e0, uint8 r0, uint256 s0,) = module.eligibilityOf(miner);
+        (bool e0, uint8 r0, uint256 s0) = module.eligibilityOf(miner);
+        Snap memory before = _snap(miner);
 
         (uint256 nonce,) = _nonce(miner);
         _expectNotEligible(2);
         _send(miner, nonce);
 
-        assertEq(core.acceptedProofs(), accepted);
-        assertEq(core.nftsMintedEver(), coreMinted);
-        assertEq(nft.mintedEver(), nftMinted);
-        assertEq(core.previousAcceptedDigest(), prevDigest);
-        assertEq(core.activeChallengeId(), activeId);
-        assertEq(module.lastAcceptedProofs(), lastAccepted);
-        (bool e1, uint8 r1, uint256 s1,) = module.eligibilityOf(miner);
+        _assertSnap(before, miner);
+        (bool e1, uint8 r1, uint256 s1) = module.eligibilityOf(miner);
         assertEq(e1, e0);
         assertEq(r1, r0);
         assertEq(s1, s0);
-        _assertNoteEmpty();
     }
 
     function _assertFlashRolledBack(SettlementFlashLender lender, SettlementMiner miner) private view {
@@ -1628,6 +1886,7 @@ contract PrefundedMiningPowerSettlementTest is PrefundedMiningStack {
         assertEq(token.balanceOf(address(module)), 0);
         assertEq(module.totalStake(), 0);
         assertEq(module.assignedOf(address(miner)), 0);
+        assertEq(module.backerOf(address(miner)), address(0));
         assertEq(nft.mintedEver(), 0);
         assertEq(core.acceptedProofs(), 0);
         _assertNoteEmpty();

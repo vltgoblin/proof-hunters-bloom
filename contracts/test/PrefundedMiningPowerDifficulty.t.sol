@@ -72,13 +72,18 @@ contract PrefundedMiningPowerDifficultyTest is Test {
     /// forge-config: default.fuzz.runs = 24
     /// forge-config: release.fuzz.runs = 24
     function testFuzz_DifficultyMatchesUngatedCore(uint256 seed) public {
-        // S6: every accepted proof locks LOCK of the miner's mint funds;
-        // funded before attach so the funds count from the first challenge.
-        _fundBeforeAttach(module, ALICE, STEPS * LOCK);
-        _fundBeforeAttach(module, BOB, STEPS * LOCK);
-        _fundBeforeAttach(module, CAROL, STEPS * LOCK);
+        // S6: every accepted proof locks LOCK of the miner's assigned stake
+        // (MIN_STAKE == LOCK, so STEPS * LOCK pays for STEPS wins). Stake is
+        // assigned after attach and matures at the next snapshot, so both
+        // twins open one more challenge (expired-seed refresh) first.
         _attach(coreP, module);
         _attach(coreD, dummy);
+        _stakeFor(module, ALICE, STEPS * LOCK);
+        _stakeFor(module, BOB, STEPS * LOCK);
+        _stakeFor(module, CAROL, STEPS * LOCK);
+        vm.roll(coreP.activeSeedParentBlock() + coreP.SEED_READABLE_PARENT_BLOCKS() + 1);
+        coreP.refreshExpiredSeed();
+        coreD.refreshExpiredSeed();
         _assertTwins();
 
         address[3] memory miners = [ALICE, BOB, CAROL];
@@ -149,7 +154,6 @@ contract PrefundedMiningPowerDifficultyTest is Test {
         assertEq(coreP.acceptedProofs(), 2);
         assertEq(coreP.activeChallengeId(), 3);
 
-        _fundBeforeAttach(module, CAROL, LOCK); // S6 mint funds
         _attach(coreP, module);
         assertTrue(module.wired());
         assertFalse(module.retired());
@@ -157,11 +161,20 @@ contract PrefundedMiningPowerDifficultyTest is Test {
         assertEq(module.lastAcceptedProofs(), coreP.acceptedProofs());
         assertFalse(module.gateDisabled());
 
+        // S6: CAROL's stake (one lock) matures at the next snapshot, opened
+        // by an expired-seed refresh (no proof); the module follows it.
+        _stakeFor(module, CAROL, LOCK);
+        _openNextChallenge(coreP);
+        assertEq(module.latestChallengeId(), 4);
+        assertEq(module.lastAcceptedProofs(), 2);
+
         // A proof through the real path advances both counters in lockstep.
         _mineOne(coreP, CAROL);
         assertEq(module.lastAcceptedProofs(), 3);
         assertEq(module.latestChallengeId(), coreP.activeChallengeId());
-        assertEq(module.latestChallengeId(), 4);
+        assertEq(module.latestChallengeId(), 5);
+        (uint256 carolLock,,,,,) = module.committedOf(3);
+        assertEq(carolLock, LOCK);
 
         // Non-terminal detach.
         vm.prank(STOP);
@@ -173,7 +186,7 @@ contract PrefundedMiningPowerDifficultyTest is Test {
         // allowed (epoch data intact), exactly like the old custody.
         _attach(coreP, module);
         assertTrue(module.wired());
-        assertEq(module.latestChallengeId(), 4);
+        assertEq(module.latestChallengeId(), 5);
         vm.prank(STOP);
         coreP.setMiningPower(IMiningPower(address(0)));
 
@@ -192,16 +205,18 @@ contract PrefundedMiningPowerDifficultyTest is Test {
 
         // Fresh module on the twin core, then mint-out retires it.
         PrefundedMiningPower mintedOut = _module(address(coreD), 0);
-        _fundBeforeAttach(mintedOut, ALICE, LOCK); // S6 mint funds
         _attach(coreD, mintedOut);
+        _stakeFor(mintedOut, ALICE, LOCK); // S6: pays the final mint's lock
+        _openNextChallenge(coreD);
         // Boundary fixture skips prior history; no production setter exists.
         coreD.setCounts(4_999, 4_999);
         stdstore.target(address(nftD)).sig("mintedEver()").checked_write(4_999);
         _mineOne(coreD, ALICE);
         assertEq(uint256(coreD.challengeState()), uint256(HunterMiningCore.ChallengeState.ENDED));
         assertEq(mintedOut.lastAcceptedProofs(), 5_000);
-        (uint256 locked,,,,) = mintedOut.committedOf(5_000);
+        (uint256 locked,,,,,) = mintedOut.committedOf(5_000);
         assertEq(locked, LOCK);
+        assertEq(mintedOut.totalStake(), 0);
         assertFalse(mintedOut.wired());
         assertTrue(mintedOut.retired());
     }
@@ -213,22 +228,29 @@ contract PrefundedMiningPowerDifficultyTest is Test {
     function testConstructorRejectsBadConfig() public {
         address core = address(coreP);
         address hunter = address(token);
+        // Every row but the one under test is valid (minStake == LOCK), so
+        // each revert is caused by its own field.
         vm.expectRevert(PrefundedMiningPower.InvalidConfiguration.selector);
-        new PrefundedMiningPower(address(0), core, 1, LOCK, 1 days, 0, address(0));
+        new PrefundedMiningPower(address(0), core, LOCK, LOCK, 1 days, 0, address(0));
         vm.expectRevert(PrefundedMiningPower.InvalidConfiguration.selector);
-        new PrefundedMiningPower(address(0xDEAD), core, 1, LOCK, 1 days, 0, address(0));
+        new PrefundedMiningPower(address(0xDEAD), core, LOCK, LOCK, 1 days, 0, address(0));
         vm.expectRevert(PrefundedMiningPower.InvalidConfiguration.selector);
-        new PrefundedMiningPower(hunter, address(0), 1, LOCK, 1 days, 0, address(0));
+        new PrefundedMiningPower(hunter, address(0), LOCK, LOCK, 1 days, 0, address(0));
         vm.expectRevert(PrefundedMiningPower.InvalidConfiguration.selector);
-        new PrefundedMiningPower(hunter, address(0xC0DE), 1, LOCK, 1 days, 0, address(0));
+        new PrefundedMiningPower(hunter, address(0xC0DE), LOCK, LOCK, 1 days, 0, address(0));
         vm.expectRevert(PrefundedMiningPower.InvalidConfiguration.selector);
-        new PrefundedMiningPower(hunter, core, 1, 0, 1 days, 0, address(0));
+        new PrefundedMiningPower(hunter, core, LOCK, 0, 1 days, 0, address(0));
+        // Floor rule: MIN_STAKE below the per-mint lock is refused.
+        vm.expectRevert(PrefundedMiningPower.InvalidConfiguration.selector);
+        new PrefundedMiningPower(hunter, core, LOCK - 1, LOCK, 1 days, 0, address(0));
+        vm.expectRevert(PrefundedMiningPower.InvalidConfiguration.selector);
+        new PrefundedMiningPower(hunter, core, 0, 1, 0, CURVE_UNIT, address(0));
 
-        // Zero minStake, zero cooldown and no guardian are valid test configs.
-        PrefundedMiningPower ok = new PrefundedMiningPower(hunter, core, 0, 1, 0, CURVE_UNIT, address(0));
+        // minStake == lock, zero cooldown and no guardian are valid test configs.
+        PrefundedMiningPower ok = new PrefundedMiningPower(hunter, core, 1, 1, 0, CURVE_UNIT, address(0));
         assertEq(address(ok.HUNTER()), hunter);
         assertEq(ok.miningCore(), core);
-        assertEq(ok.MIN_STAKE(), 0);
+        assertEq(ok.MIN_STAKE(), 1);
         assertEq(ok.LOCK_PER_MINT(), 1);
         assertEq(ok.EXIT_COOLDOWN(), 0);
         assertEq(ok.CURVE_UNIT(), CURVE_UNIT);
@@ -238,7 +260,6 @@ contract PrefundedMiningPowerDifficultyTest is Test {
         assertFalse(ok.gateDisabled());
         assertEq(ok.totalStake(), 0);
         assertEq(ok.totalAssigned(), 0);
-        assertEq(ok.totalFunds(), 0);
         assertEq(ok.totalCommitted(), 0);
     }
 
@@ -250,8 +271,9 @@ contract PrefundedMiningPowerDifficultyTest is Test {
         // CURVE_UNIT == 0 → exactly 1.0x through the real submitProof path:
         // a digest just above the base target is rejected against the base
         // target itself (no widening), one inside it mints.
-        _fundBeforeAttach(module, ALICE, LOCK); // S6 mint funds
         _attach(coreP, module);
+        _stakeFor(module, ALICE, LOCK); // S6: one lock's worth, matured below
+        _openNextChallenge(coreP);
         _activate(coreP);
         uint256 baseTarget = coreP.currentTarget();
         uint256 id = coreP.activeChallengeId();
@@ -282,10 +304,13 @@ contract PrefundedMiningPowerDifficultyTest is Test {
         assertEq(curved.multiplierFromLockedAmount(3_000e18), 2e18);
         assertEq(curved.multiplierFromLockedAmount(1e40), 3e18);
 
-        // With no stake ledger yet, even a curve-enabled module feeds the core
-        // the 1.0x base: an above-target digest still fails at the base target.
-        _fundBeforeAttach(curved, ALICE, LOCK); // S6 mint funds
+        // A curve-enabled module with a matured stake below one curve unit
+        // (the floor, LOCK) feeds the core the 1.0x base: an above-target
+        // digest still fails at the base target.
         _attach(coreD, curved);
+        _stakeFor(curved, ALICE, LOCK);
+        _openNextChallenge(coreD);
+        assertEq(curved.previewSubmit(ALICE), 1e18);
         _activate(coreD);
         uint256 baseD = coreD.currentTarget();
         id = coreD.activeChallengeId();
@@ -313,17 +338,30 @@ contract PrefundedMiningPowerDifficultyTest is Test {
         assertEq(address(nft), predictedNFT);
     }
 
+    /// @dev Smallest legal floor: MIN_STAKE == LOCK_PER_MINT.
     function _module(address core, uint256 curveUnit) private returns (PrefundedMiningPower) {
-        return new PrefundedMiningPower(address(token), core, 0, LOCK, 1 days, curveUnit, address(0));
+        return new PrefundedMiningPower(address(token), core, LOCK, LOCK, 1 days, curveUnit, address(0));
     }
 
-    /// @dev S6: fixture HUNTER (dealt; the token has no mint) funds `wallet`
-    /// on `m` before it is attached, so the funds count from the attach
-    /// challenge on.
-    function _fundBeforeAttach(PrefundedMiningPower m, address wallet, uint256 amount) private {
-        deal(address(token), address(this), amount, true);
+    /// @dev S6: a dedicated backer (fixture HUNTER is dealt; the token has
+    /// no mint) deposits `amount` on the attached `m` and assigns it to
+    /// `wallet`. Pending until the next snapshot.
+    function _stakeFor(PrefundedMiningPower m, address wallet, uint256 amount) private {
+        address backer = address(uint160(uint256(keccak256(abi.encode("difficulty backer", wallet)))));
+        deal(address(token), backer, amount, true);
+        vm.startPrank(backer);
         token.approve(address(m), amount);
-        m.fund(wallet, amount);
+        m.deposit(amount);
+        m.assign(wallet, amount);
+        vm.stopPrank();
+    }
+
+    /// @dev Opens the next challenge on `core` without a proof (expired-seed
+    /// refresh), which snapshots it on the attached module.
+    function _openNextChallenge(HunterMiningHarness core) private {
+        uint256 expiry = core.activeSeedParentBlock() + core.SEED_READABLE_PARENT_BLOCKS() + 1;
+        if (block.number < expiry) vm.roll(expiry);
+        core.refreshExpiredSeed();
     }
 
     function _attach(HunterMiningHarness core, IMiningPower power) private {

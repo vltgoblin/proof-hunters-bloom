@@ -160,8 +160,9 @@ contract PrefundedReentrantHunter is ERC20 {
     }
 }
 
-/// @notice S4 (VLT-55) stake-ledger and S6 (VLT-57) mint-funds hostile-token
-/// and fail-closed suite.
+/// @notice S4 (VLT-55) stake-ledger, S6 (VLT-57) per-mint lock and S7
+/// (VLT-58) release hostile-token and fail-closed suite. Single bucket (owner
+/// decision 2026-09-25): every lock is paid from assigned stake.
 /// Hostile tokens back separately constructed modules bound to the REAL core
 /// (the core never touches the token); `token` / `module` are the harness's
 /// token-bound fixture. All amounts are TEST-ONLY fixture values.
@@ -173,7 +174,8 @@ contract PrefundedMiningPowerHostileTest is PrefundedMiningStack {
 
     function setUp() public override {
         super.setUp();
-        _deployModule(0, LOCK, COOLDOWN, 0, address(0));
+        // Smallest legal floor: MIN_STAKE == LOCK_PER_MINT.
+        _deployModule(LOCK, LOCK, COOLDOWN, 0, address(0));
         _attach(module);
     }
 
@@ -393,7 +395,7 @@ contract PrefundedMiningPowerHostileTest is PrefundedMiningStack {
         vm.prank(BOB);
         token.approve(address(module), type(uint256).max);
 
-        string[3] memory totals = ["totalStake()", "totalFunds()", "totalCommitted()"];
+        string[2] memory totals = ["totalStake()", "totalCommitted()"];
         for (uint256 i = 0; i < totals.length; i++) {
             uint256 original = i == 0 ? 1_000e18 : 0;
             uint256 corrupted = i == 0 ? bal + 1 : 1;
@@ -429,124 +431,140 @@ contract PrefundedMiningPowerHostileTest is PrefundedMiningStack {
     }
 
     // ------------------------------------------------------------------
-    // S6: mint funds under hostile tokens and corrupted totals
+    // S7: release under hostile tokens and corrupted totals
     // ------------------------------------------------------------------
 
-    function testFundFeeOnTransferCreditsMeasuredReceipt() public {
-        PrefundedFeeHunter fee = new PrefundedFeeHunter(1_000); // 10%
-        PrefundedMiningPower m = _hostileModule(address(fee));
-        fee.setModule(address(m));
-        fee.mint(FUNDER, 1_000e18);
-        vm.startPrank(FUNDER);
-        fee.approve(address(m), type(uint256).max);
-        vm.expectEmit(true, true, false, true, address(m));
-        emit PrefundedMiningPower.Funded(FUNDER, MINER, 900e18);
-        m.fund(MINER, 1_000e18);
-        vm.stopPrank();
-        assertEq(m.fundsOf(MINER), 900e18);
-        assertEq(m.pendingFunds(MINER), 900e18);
-        assertEq(m.totalFunds(), 900e18);
-        assertEq(m.fundsOf(FUNDER), 0);
-        assertEq(fee.balanceOf(address(m)), 900e18);
+    /// @dev The token contract itself is the final beneficiary of a burned,
+    /// locked NFT and holds unassigned stake, so every re-entrant payload
+    /// (msg.sender == token) would otherwise succeed. Each is fired from
+    /// inside the claim transfer of another beneficiary's lock. ALICE backs
+    /// the token contract's single win and FUNDER backs BOB's six; each
+    /// backer's stake is exactly consumed by those locks.
+    function testReentrantTokenCannotReenterClaim() public {
+        PrefundedReentrantHunter re = new PrefundedReentrantHunter();
+        PrefundedMiningPower m = _hostileModule(address(re));
+        _detach();
+        _attach(m);
 
-        // Only the credited amount can leave, only to the wallet, in full.
-        vm.prank(FUNDER);
-        vm.expectRevert(abi.encodeWithSelector(PrefundedMiningPower.InsufficientFunds.selector, 0, 1));
-        m.withdrawFunds(1);
-        vm.prank(MINER);
-        vm.expectRevert(abi.encodeWithSelector(PrefundedMiningPower.InsufficientFunds.selector, 900e18, 1_000e18));
-        m.withdrawFunds(1_000e18);
-        vm.prank(MINER);
-        m.withdrawFunds(900e18);
-        assertEq(fee.balanceOf(MINER), 900e18);
-        assertEq(fee.balanceOf(address(m)), 0);
-        assertEq(m.totalFunds(), 0);
-        assertEq(m.pendingFunds(MINER), 0);
+        re.mint(address(re), 1_000e18);
+        vm.startPrank(address(re));
+        re.approve(address(m), type(uint256).max);
+        m.deposit(300e18);
+        vm.stopPrank();
+        re.mint(ALICE, LOCK);
+        vm.startPrank(ALICE);
+        re.approve(address(m), type(uint256).max);
+        m.deposit(LOCK);
+        m.assign(address(re), LOCK);
+        vm.stopPrank();
+        re.mint(FUNDER, 6 * LOCK);
+        vm.startPrank(FUNDER);
+        re.approve(address(m), type(uint256).max);
+        m.deposit(6 * LOCK);
+        m.assign(BOB, 6 * LOCK);
+        vm.stopPrank();
+        _nextChallenge();
+
+        uint256 own = _win(address(re));
+        uint256[6] memory ids;
+        for (uint256 i = 0; i < ids.length; i++) {
+            ids[i] = _win(BOB);
+        }
+        _burn(own);
+        for (uint256 i = 0; i < ids.length; i++) {
+            _burn(ids[i]);
+        }
+        assertEq(m.totalCommitted(), 7 * LOCK);
+        assertEq(m.totalAssigned(), 0);
+
+        bytes[6] memory payloads = [
+            abi.encodeCall(PrefundedMiningPower.claimCommitted, (own)),
+            abi.encodeCall(PrefundedMiningPower.claimCommittedTo, (own, address(re))),
+            abi.encodeCall(PrefundedMiningPower.withdraw, (1)),
+            abi.encodeCall(PrefundedMiningPower.assign, (MINER, 1)),
+            abi.encodeCall(PrefundedMiningPower.unassign, (MINER, 1)),
+            abi.encodeCall(PrefundedMiningPower.deposit, (1))
+        ];
+        bytes4 guardErr = ReentrancyGuard.ReentrancyGuardReentrantCall.selector;
+        for (uint256 i = 0; i < payloads.length; i++) {
+            re.configure(address(m), payloads[i]);
+            vm.prank(BOB);
+            m.claimCommitted(ids[i]);
+            _assertReentryBlocked(re, guardErr);
+            // Only the outer claim took effect.
+            assertEq(re.balanceOf(BOB), (i + 1) * LOCK);
+            assertEq(m.totalCommitted(), (6 - i) * LOCK);
+            (,,,,, bool ownReleased) = m.committedOf(own);
+            assertFalse(ownReleased);
+            assertEq(m.unassignedOf(address(re)), 300e18);
+            assertEq(m.assignedOf(MINER), 0);
+            assertEq(m.totalStake(), 300e18);
+            assertEq(re.balanceOf(address(m)), 300e18 + (6 - i) * LOCK);
+        }
+
+        // Without a payload the token contract claims its own lock normally.
+        re.configure(address(m), "");
+        uint256 before = re.balanceOf(address(re));
+        vm.prank(address(re));
+        m.claimCommitted(own);
+        assertEq(re.balanceOf(address(re)), before + LOCK);
+        assertEq(m.totalCommitted(), 0);
+        assertEq(re.balanceOf(address(m)), 300e18);
     }
 
-    function testFundZeroReceiptReverts() public {
-        PrefundedFeeHunter fee = new PrefundedFeeHunter(10_000); // full tax
-        PrefundedMiningPower m = _hostileModule(address(fee));
-        fee.setModule(address(m));
-        fee.mint(FUNDER, 1_000e18);
-        vm.startPrank(FUNDER);
-        fee.approve(address(m), type(uint256).max);
-        vm.expectRevert(PrefundedMiningPower.UnsupportedTokenReceipt.selector);
-        m.fund(MINER, 1_000e18);
-        vm.stopPrank();
-        assertEq(m.totalFunds(), 0);
-        assertEq(m.fundsOf(MINER), 0);
-        assertEq(m.pendingFunds(MINER), 0);
-        assertEq(fee.balanceOf(FUNDER), 1_000e18);
+    /// @dev Any total bumped past the balance blocks the claim (Insolvency)
+    /// and leaves the lock claimable; honest totals let it pay.
+    function testCorruptedTotalCommittedBlocksClaim() public {
+        _deposit(ALICE, 1_000e18);
+        _assign(ALICE, MINER, LOCK + 5e18);
+        _nextChallenge();
+        uint256 id = _win(MINER);
+        _burn(id);
+        uint256 bal = token.balanceOf(address(module));
+        assertEq(bal, 1_000e18);
+        assertEq(module.totalCommitted(), LOCK);
+        assertEq(module.totalStake(), 1_000e18 - LOCK);
 
-        // Over-receipt (S0 default 5) reverts too.
-        PrefundedBonusHunter bonus = new PrefundedBonusHunter();
-        PrefundedMiningPower mb = _hostileModule(address(bonus));
-        bonus.setModule(address(mb));
-        bonus.mint(FUNDER, 1_000e18);
-        vm.startPrank(FUNDER);
-        bonus.approve(address(mb), type(uint256).max);
-        vm.expectRevert(PrefundedMiningPower.UnsupportedTokenReceipt.selector);
-        mb.fund(MINER, 1_000e18);
-        vm.stopPrank();
-        assertEq(mb.totalFunds(), 0);
-        assertEq(bonus.balanceOf(address(mb)), 0);
-    }
+        string[2] memory totals = ["totalCommitted()", "totalStake()"];
+        uint256[2] memory originals = [LOCK, 1_000e18 - LOCK];
+        for (uint256 i = 0; i < totals.length; i++) {
+            stdstore.target(address(module)).sig(totals[i]).checked_write(originals[i] + 1);
+            vm.prank(MINER);
+            vm.expectRevert(PrefundedMiningPower.Insolvency.selector);
+            module.claimCommitted(id);
+            vm.prank(MINER);
+            vm.expectRevert(PrefundedMiningPower.Insolvency.selector);
+            module.claimCommittedTo(id, BOB);
+            (,,,,, bool released) = module.committedOf(id);
+            assertFalse(released);
+            assertEq(token.balanceOf(address(module)), bal);
+            assertEq(token.balanceOf(MINER), 0);
+            assertEq(token.balanceOf(BOB), 0);
+            stdstore.target(address(module)).sig(totals[i]).checked_write(originals[i]);
+        }
 
-    function testFundInputValidationAndStateGates() public {
-        token.mint(FUNDER, 10e18);
-        vm.startPrank(FUNDER);
-        token.approve(address(module), type(uint256).max);
-        vm.expectRevert(PrefundedMiningPower.ZeroAddress.selector);
-        module.fund(address(0), 1);
-        vm.expectRevert(PrefundedMiningPower.ZeroAmount.selector);
-        module.fund(MINER, 0);
-        vm.stopPrank();
-        vm.prank(MINER);
-        vm.expectRevert(PrefundedMiningPower.ZeroAmount.selector);
-        module.withdrawFunds(0);
-
-        // Allowed on an unattached module (counts from the attach snapshot on).
-        PrefundedMiningPower fresh = new PrefundedMiningPower(address(token), address(core), 0, LOCK, 0, 0, address(0));
-        vm.startPrank(FUNDER);
-        token.approve(address(fresh), type(uint256).max);
-        fresh.fund(MINER, 1e18);
-        vm.stopPrank();
-        assertEq(fresh.fundsOf(MINER), 1e18);
-        assertEq(fresh.eligibleFundsOf(MINER), 0);
-
-        // Failsafe fired: refused (S8 lands `disableRequirement`; injected).
-        uint256 slot = stdstore.enable_packed_slots().target(address(module)).sig("gateDisabled()").find();
-        bytes32 raw = vm.load(address(module), bytes32(slot));
-        stdstore.enable_packed_slots().target(address(module)).sig("gateDisabled()").checked_write(true);
-        vm.prank(FUNDER);
-        vm.expectRevert(PrefundedMiningPower.GateDisabled.selector);
-        module.fund(MINER, 1);
-        vm.store(address(module), bytes32(slot), raw);
-        assertFalse(module.gateDisabled());
-
-        // Retired (terminal stop): refused; withdrawal still works.
-        _fund(MINER, 5e18);
-        vm.prank(STOP);
-        core.stopMining();
-        assertTrue(module.retired());
-        vm.prank(FUNDER);
-        vm.expectRevert(PrefundedMiningPower.Retired.selector);
-        module.fund(MINER, 1);
-        vm.prank(MINER);
-        module.withdrawFunds(5e18);
-        assertEq(token.balanceOf(MINER), 5e18);
+        _claim(id, MINER);
+        assertEq(token.balanceOf(MINER), LOCK);
+        assertEq(module.totalCommitted(), 0);
         _assertBooks();
     }
 
-    function testWithdrawFundsExactDebitAndSolvency() public {
+    /// @dev An outbound debit that differs from the lock in either direction
+    /// reverts DebitMismatch and leaves the lock claimable.
+    function testClaimDebitMismatchReverts() public {
         PrefundedMisDebitHunter bad = new PrefundedMisDebitHunter();
         PrefundedMiningPower m = _hostileModule(address(bad));
-        bad.mint(FUNDER, 1_000e18);
-        vm.startPrank(FUNDER);
-        bad.approve(address(m), type(uint256).max);
-        m.fund(MINER, 1_000e18);
+        _detach();
+        _attach(m);
+        bad.mint(ALICE, LOCK);
+        vm.startPrank(ALICE);
+        bad.approve(address(m), LOCK);
+        m.deposit(LOCK);
+        m.assign(MINER, LOCK);
         vm.stopPrank();
+        _nextChallenge();
+        uint256 id = _win(MINER);
+        _burn(id);
         // Surplus so an over-debit is not also an insolvency.
         bad.mint(address(m), 10);
 
@@ -554,137 +572,28 @@ contract PrefundedMiningPowerHostileTest is PrefundedMiningStack {
             bad.configure(address(m), mode);
             vm.prank(MINER);
             vm.expectRevert(PrefundedMiningPower.DebitMismatch.selector);
-            m.withdrawFunds(400e18);
-            assertEq(m.fundsOf(MINER), 1_000e18);
-            assertEq(m.pendingFunds(MINER), 1_000e18);
-            assertEq(m.totalFunds(), 1_000e18);
-            assertEq(bad.balanceOf(address(m)), 1_000e18 + 10);
+            m.claimCommitted(id);
+            (,,,,, bool released) = m.committedOf(id);
+            assertFalse(released);
+            assertEq(m.totalCommitted(), LOCK);
+            assertEq(m.totalStake(), 0);
+            assertEq(bad.balanceOf(address(m)), LOCK + 10);
             assertEq(bad.balanceOf(MINER), 0);
         }
         bad.configure(address(m), 0);
-        vm.expectEmit(true, false, false, true, address(m));
-        emit PrefundedMiningPower.FundsWithdrawn(MINER, 1_000e18);
         vm.prank(MINER);
-        m.withdrawFunds(1_000e18);
-        assertEq(bad.balanceOf(MINER), 1_000e18);
-        assertEq(m.totalFunds(), 0);
+        m.claimCommitted(id);
+        assertEq(bad.balanceOf(MINER), LOCK);
+        assertEq(m.totalCommitted(), 0);
         assertEq(bad.balanceOf(address(m)), 10);
-    }
-
-    function testReentrantTokenCannotReenterFundPaths() public {
-        PrefundedReentrantHunter re = new PrefundedReentrantHunter();
-        PrefundedMiningPower m = _hostileModule(address(re));
-        _detach();
-        _attach(m);
-
-        // The token contract holds stake and mint funds of its own, so every
-        // re-entrant payload (msg.sender == token) would otherwise succeed.
-        re.mint(address(re), 1_000e18);
-        vm.startPrank(address(re));
-        re.approve(address(m), type(uint256).max);
-        m.deposit(300e18);
-        m.fund(address(re), 300e18);
-        vm.stopPrank();
-
-        re.mint(FUNDER, 1_000e18);
-        vm.prank(FUNDER);
-        re.approve(address(m), type(uint256).max);
-
-        bytes[5] memory payloads = [
-            abi.encodeCall(PrefundedMiningPower.fund, (MINER, 1)),
-            abi.encodeCall(PrefundedMiningPower.fund, (address(re), 1)),
-            abi.encodeCall(PrefundedMiningPower.withdrawFunds, (1)),
-            abi.encodeCall(PrefundedMiningPower.deposit, (1)),
-            abi.encodeCall(PrefundedMiningPower.withdraw, (1))
-        ];
-        bytes4 guardErr = ReentrancyGuard.ReentrancyGuardReentrantCall.selector;
-        uint256 minerFunds;
-        for (uint256 i = 0; i < payloads.length; i++) {
-            // During fund.
-            re.configure(address(m), payloads[i]);
-            vm.prank(FUNDER);
-            m.fund(MINER, 100e18);
-            minerFunds += 100e18;
-            _assertReentryBlocked(re, guardErr);
-            _assertReentrantFundBooks(m, re, minerFunds);
-
-            // During withdrawFunds.
-            re.configure(address(m), payloads[i]);
-            vm.prank(MINER);
-            m.withdrawFunds(40e18);
-            minerFunds -= 40e18;
-            _assertReentryBlocked(re, guardErr);
-            _assertReentrantFundBooks(m, re, minerFunds);
-        }
-    }
-
-    function testCorruptedTotalFundsBlocksExits() public {
-        _deposit(ALICE, 1_000e18);
-        _fund(MINER, 500e18);
-        uint256 bal = token.balanceOf(address(module));
-        assertEq(bal, 1_500e18);
-        token.mint(BOB, 10e18);
-        vm.prank(BOB);
-        token.approve(address(module), type(uint256).max);
-
-        string[2] memory totals = ["totalFunds()", "totalCommitted()"];
-        uint256[2] memory originals = [uint256(500e18), 0];
-        for (uint256 i = 0; i < totals.length; i++) {
-            // One unit more than the balance covers.
-            uint256 corrupted = originals[i] + 1;
-            stdstore.target(address(module)).sig(totals[i]).checked_write(corrupted);
-
-            vm.prank(MINER);
-            vm.expectRevert(PrefundedMiningPower.Insolvency.selector);
-            module.withdrawFunds(100e18);
-            vm.prank(ALICE);
-            vm.expectRevert(PrefundedMiningPower.Insolvency.selector);
-            module.withdraw(100e18);
-            vm.prank(BOB);
-            vm.expectRevert(PrefundedMiningPower.Insolvency.selector);
-            module.fund(MINER, 10e18);
-            vm.prank(BOB);
-            vm.expectRevert(PrefundedMiningPower.Insolvency.selector);
-            module.deposit(10e18);
-
-            assertEq(token.balanceOf(address(module)), bal);
-            assertEq(module.fundsOf(MINER), 500e18);
-            assertEq(module.unassignedOf(ALICE), 1_000e18);
-            assertEq(token.balanceOf(MINER), 0);
-            assertEq(token.balanceOf(ALICE), 0);
-
-            stdstore.target(address(module)).sig(totals[i]).checked_write(originals[i]);
-        }
-
-        vm.prank(MINER);
-        module.withdrawFunds(500e18);
-        _withdraw(ALICE, 1_000e18);
-        assertEq(token.balanceOf(MINER), 500e18);
-        assertEq(token.balanceOf(ALICE), 1_000e18);
-        assertEq(token.balanceOf(address(module)), 0);
-        _assertBooks();
     }
 
     // ------------------------------------------------------------------
     // Helpers
     // ------------------------------------------------------------------
 
-    /// @dev Only the outer call's effect is visible: the token contract's
-    /// own stake (300) and funds (300) are untouched.
-    function _assertReentrantFundBooks(PrefundedMiningPower m, PrefundedReentrantHunter re, uint256 minerFunds)
-        private
-        view
-    {
-        assertEq(m.fundsOf(MINER), minerFunds);
-        assertEq(m.fundsOf(address(re)), 300e18);
-        assertEq(m.unassignedOf(address(re)), 300e18);
-        assertEq(m.totalStake(), 300e18);
-        assertEq(m.totalFunds(), 300e18 + minerFunds);
-        assertEq(re.balanceOf(address(m)), 600e18 + minerFunds);
-    }
-
     function _hostileModule(address hunter) private returns (PrefundedMiningPower) {
-        return new PrefundedMiningPower(hunter, address(core), 0, LOCK, COOLDOWN, 0, address(0));
+        return new PrefundedMiningPower(hunter, address(core), LOCK, LOCK, COOLDOWN, 0, address(0));
     }
 
     function _assertReentryBlocked(PrefundedReentrantHunter re, bytes4 guardErr) private view {
