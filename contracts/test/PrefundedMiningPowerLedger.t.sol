@@ -55,6 +55,7 @@ contract PrefundedMiningPowerLedgerTest is PrefundedMiningStack {
         assertEq(token.balanceOf(address(module)), 5_000e18);
         _assertBooks();
 
+        _approve(MINER, ALICE);
         vm.expectEmit(true, true, false, true, address(module));
         emit PrefundedMiningPower.Assigned(ALICE, MINER, 2_000e18, t0);
         _assign(ALICE, MINER, 2_000e18);
@@ -125,6 +126,7 @@ contract PrefundedMiningPowerLedgerTest is PrefundedMiningStack {
     function testUnassignRemovalAppliesNextChallenge() public {
         _useCurvedModule();
         _deposit(ALICE, 3_000e18 + LOCK);
+        _approve(MINER, ALICE);
         _assign(ALICE, MINER, LOCK);
         _nextChallenge(); // the one-lock base matures: MINER passes the floor
         _activate();
@@ -200,6 +202,7 @@ contract PrefundedMiningPowerLedgerTest is PrefundedMiningStack {
         _activate();
         uint256 c1 = cid;
         _deposit(ALICE, 600e18);
+        _approve(MINER, ALICE);
         _assign(ALICE, MINER, 600e18); // pending for c1
 
         _win(OUTSIDER); // c2 opens: ALICE's 600 matured
@@ -217,6 +220,7 @@ contract PrefundedMiningPowerLedgerTest is PrefundedMiningStack {
         assertEq(module.removingOf(MINER), 600e18);
 
         _deposit(BOB, 1_000e18);
+        _approve(MINER, BOB); // S8b: the wallet consents to BOB
         // S8: ALICE's removal still counts in c2 — BOB may not take the slot.
         vm.prank(BOB);
         vm.expectRevert(abi.encodeWithSelector(PrefundedMiningPower.WalletHasCountingRemoval.selector, 600e18));
@@ -281,6 +285,8 @@ contract PrefundedMiningPowerLedgerTest is PrefundedMiningStack {
     /// (`WalletAlreadyBacked`), and no depositor can pull more than their
     /// own assignment or withdraw another's stake.
     function testTwoDepositorsCannotStealSharedAssignment() public {
+        _approve(MINER, ALICE);
+        _approve(MINER2, BOB);
         _deposit(ALICE, 1_000e18);
         _assign(ALICE, MINER, 1_000e18);
         _deposit(BOB, 2_000e18);
@@ -336,6 +342,8 @@ contract PrefundedMiningPowerLedgerTest is PrefundedMiningStack {
     /// reverts, then unlocks one full cooldown after the top-up.
     function testTopUpAssignResetsThisDepositorsUnlockClockOnly() public {
         uint256 t0 = block.timestamp;
+        _approve(MINER, ALICE);
+        _approve(MINER2, BOB);
         _deposit(ALICE, 1_000e18);
         _assign(ALICE, MINER, 500e18); // ALICE earliest t0 + 1h
         _deposit(BOB, 1_000e18);
@@ -376,6 +384,8 @@ contract PrefundedMiningPowerLedgerTest is PrefundedMiningStack {
         assertEq(core.acceptedProofs(), 0);
         assertEq(module.lastAcceptedProofs(), 0);
         uint256 t0 = block.timestamp;
+        _approve(MINER, ALICE);
+        _approve(MINER2, BOB);
         _deposit(ALICE, 1_000e18);
         _assign(ALICE, MINER, 1_000e18);
         vm.warp(t0 + COOLDOWN / 2);
@@ -430,6 +440,8 @@ contract PrefundedMiningPowerLedgerTest is PrefundedMiningStack {
         vm.prank(MINER);
         vm.expectRevert(PrefundedMiningPower.SelfAssignment.selector);
         module.assign(MINER, 500e18);
+        _approve(ALICE, MINER);
+        _approve(MINER, ALICE);
         _assign(MINER, ALICE, 500e18);
         _assign(ALICE, MINER, 1_000e18);
         assertEq(module.assignedOf(MINER), 1_000e18);
@@ -467,6 +479,7 @@ contract PrefundedMiningPowerLedgerTest is PrefundedMiningStack {
 
         // Wired: allowed, pending for the open challenge.
         _attach(module);
+        _approve(MINER, ALICE);
         _assign(ALICE, MINER, 100e18);
         assertEq(module.pendingEpoch(MINER), core.activeChallengeId());
 
@@ -511,6 +524,7 @@ contract PrefundedMiningPowerLedgerTest is PrefundedMiningStack {
 
     function testCooldownWaivedAfterTerminalDetach() public {
         uint256 t0 = block.timestamp;
+        _approve(MINER, ALICE);
         _deposit(ALICE, 1_000e18);
         _assign(ALICE, MINER, 1_000e18);
         vm.prank(ALICE);
@@ -538,6 +552,7 @@ contract PrefundedMiningPowerLedgerTest is PrefundedMiningStack {
         _deployModule(LOCK, LOCK, COOLDOWN, 0, GUARDIAN);
         _attach(module);
         uint256 t0 = block.timestamp;
+        _approve(MINER, ALICE);
         _deposit(ALICE, 1_000e18);
         _assign(ALICE, MINER, 600e18);
         vm.prank(GUARDIAN);
@@ -561,6 +576,8 @@ contract PrefundedMiningPowerLedgerTest is PrefundedMiningStack {
         vm.expectRevert(PrefundedMiningPower.ZeroAmount.selector);
         module.deposit(0);
         _deposit(ALICE, 1_000e18);
+        _approve(MINER, ALICE);
+        _approve(MINER2, ALICE);
 
         vm.startPrank(ALICE);
         vm.expectRevert(PrefundedMiningPower.ZeroAddress.selector);
@@ -675,6 +692,7 @@ contract PrefundedMiningPowerLedgerTest is PrefundedMiningStack {
     /// held; in a mixed exit only the matured part is held.
     function testPendingUnassignIsImmediatelyWithdrawable() public {
         uint256 c = core.activeChallengeId();
+        _approve(MINER, ALICE);
         _deposit(ALICE, 1_000e18);
         _assign(ALICE, MINER, 1_000e18);
         vm.warp(block.timestamp + COOLDOWN);
@@ -740,6 +758,84 @@ contract PrefundedMiningPowerLedgerTest is PrefundedMiningStack {
         _assertBooks();
     }
 
+    /// @dev S8b (TLA+ F1, review #2), curve on: after the failsafe the hold
+    /// is waived, so matured stake unassigned mid-challenge leaves at once —
+    /// and it must stop counting at once, in the failsafe's own challenge
+    /// AND every later one. Three wallets each carry 1,500 matured (1.5x);
+    /// in challenge k the backer of wallet k pulls and withdraws 1,000, and
+    /// wallet k's preview, its eligibility stake and the real core's target
+    /// all fall to the live 500 (1.0x: a 1.5x-band digest is rejected at the
+    /// base target), while the next wallet — untouched — still mines with
+    /// the widened target and opens the next challenge (free mining, no
+    /// lock). Before S8b the removal was added back (1,500 → 1.5x).
+    function test_FailsafeStopsCountingRemovals() public {
+        _detach();
+        _deployModule(LOCK, LOCK, COOLDOWN, CURVE_UNIT, GUARDIAN);
+        _attach(module);
+        address[3] memory ds = [ALICE, BOB, CAROL];
+        address[3] memory ws = [MINER, MINER2, OUTSIDER];
+        uint256 full = 1_500e18;
+        uint256 pulled = 1_000e18;
+        for (uint256 i = 0; i < 3; i++) {
+            _approve(ws[i], ds[i]);
+            _deposit(ds[i], full);
+            _assign(ds[i], ws[i], full);
+        }
+        _nextChallenge(); // everything matured
+        _activate();
+        uint256 c1 = cid;
+        assertEq(module.multiplierFromLockedAmount(full), 15e17);
+        assertEq(module.multiplierFromLockedAmount(full - pulled), 1e18);
+
+        vm.prank(GUARDIAN);
+        module.disableRequirement();
+        assertEq(module.holdWaivedEpoch(), c1);
+
+        for (uint256 k = 0; k < 3; k++) {
+            assertEq(cid, c1 + k);
+            // Wallet k's backer exits 1,000 at once (cooldown and hold waived).
+            _unassign(ds[k], ws[k], pulled);
+            assertEq(module.removingOf(ws[k]), pulled);
+            _withdraw(ds[k], pulled);
+            // Every wallet reflects only its live stake.
+            for (uint256 j = 0; j < 3; j++) {
+                uint256 live = j <= k ? full - pulled : full;
+                assertEq(module.assignedOf(ws[j]), live);
+                _assertStake(ws[j], true, live);
+                assertEq(module.previewSubmit(ws[j]), live >= 1_000e18 ? 15e17 : 1e18);
+            }
+            // The real core: a 1.5x-band digest is rejected for wallet k at
+            // the base target...
+            uint256 base = core.currentTarget();
+            uint256 band = _widen(base, 15e17);
+            assertGt(band, base);
+            (uint256 n, bytes32 d) = _bandNonce(ws[k], base, band);
+            vm.prank(ws[k]);
+            vm.expectRevert(abi.encodeWithSelector(HunterMiningCore.InvalidProof.selector, d, base));
+            core.submitProof(cid, seed, n, basket);
+            // ...and accepted for an untouched wallet (still 1.5x), which
+            // opens the next challenge without a lock. In the last round
+            // wallet 0 (live 500) just mines at the base target.
+            uint256 before = nft.mintedEver();
+            if (k < 2) {
+                (n,) = _bandNonce(ws[k + 1], base, band);
+                vm.prank(ws[k + 1]);
+                core.submitProof(cid, seed, n, basket);
+            } else {
+                (n,) = _nonce(ws[0]);
+                _send(ws[0], n);
+            }
+            assertEq(nft.mintedEver(), before + 1);
+            (uint256 locked,,,,,) = module.committedOf(before + 1);
+            assertEq(locked, 0);
+            _activate();
+        }
+        assertEq(module.totalCommitted(), 0);
+        assertEq(module.totalStake(), 3 * (full - pulled));
+        assertEq(token.balanceOf(address(module)), 3 * (full - pulled));
+        _assertBooks();
+    }
+
     /// @dev A non-terminal detach also waives the hold (a module that is
     /// never re-wired would otherwise keep the stake forever). The released
     /// removal then no longer counts if the module is re-wired into the same
@@ -786,6 +882,7 @@ contract PrefundedMiningPowerLedgerTest is PrefundedMiningStack {
         uint256 c = cid;
         vm.warp(block.timestamp + COOLDOWN);
         _unassign(ALICE, MINER, GATED_MIN);
+        _approve(MINER2, ALICE);
         _assign(ALICE, MINER2, GATED_MIN);
         assertEq(module.unassignedOf(ALICE), 0);
         assertEq(module.heldStakeOf(ALICE), GATED_MIN);
@@ -872,6 +969,11 @@ contract PrefundedMiningPowerLedgerTest is PrefundedMiningStack {
                     address w = module.assigneeOf(d);
                     if (w == address(0)) w = ws[(r >> 128) % 2];
                     uint256 a = (amt % avail) + 1;
+                    // S8b: an empty slot needs the wallet's consent; half
+                    // the time the wallet approves `d` first, otherwise the
+                    // assign must fail `BackerNotApproved` (unless `d` is
+                    // still approved from before).
+                    if (module.assignedOf(w) == 0 && (r >> 200) % 2 == 0) _approve(w, d);
                     bytes memory err = _expectedAssignError(d, w, a);
                     if (err.length != 0) {
                         vm.prank(d);
@@ -977,14 +1079,19 @@ contract PrefundedMiningPowerLedgerTest is PrefundedMiningStack {
     // ------------------------------------------------------------------
 
     /// @dev The revert `assign(w, a)` by `d` must produce (empty = none),
-    /// for a wired, live module: one backer per wallet, and (S8) a first
-    /// assign of at least MIN_STAKE that is refused while removed stake still
-    /// counts for the wallet in the open challenge.
+    /// for a wired, live module: one backer per wallet, (S8b) the wallet's
+    /// approval to take an empty slot, and (S8) a first assign of at least
+    /// MIN_STAKE that is refused while removed stake still counts for the
+    /// wallet in the open challenge.
     function _expectedAssignError(address d, address w, uint256 a) private view returns (bytes memory) {
         if (module.assignedOf(w) != 0) {
             address backer = module.backerOf(w);
             if (backer != d) return abi.encodeWithSelector(PrefundedMiningPower.WalletAlreadyBacked.selector, backer);
             return "";
+        }
+        address approved = module.approvedBackerOf(w);
+        if (approved != d) {
+            return abi.encodeWithSelector(PrefundedMiningPower.BackerNotApproved.selector, w, approved);
         }
         if (a < module.MIN_STAKE()) {
             return abi.encodeWithSelector(PrefundedMiningPower.FirstAssignBelowMinimum.selector, a, module.MIN_STAKE());
@@ -1055,6 +1162,7 @@ contract PrefundedMiningPowerLedgerTest is PrefundedMiningStack {
     /// snapshot.
     function _backOutsider(uint256 wins) private {
         uint256 stake = module.MIN_STAKE() + (wins - 1) * LOCK;
+        _approve(OUTSIDER, OUTSIDER_BACKER);
         _deposit(OUTSIDER_BACKER, stake);
         _assign(OUTSIDER_BACKER, OUTSIDER, stake);
     }

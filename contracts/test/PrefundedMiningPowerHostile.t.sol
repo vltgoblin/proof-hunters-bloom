@@ -305,6 +305,8 @@ contract PrefundedMiningPowerHostileTest is PrefundedMiningStack {
         // The token contract itself holds stake and an assignment, so each
         // re-entrant payload (sent with msg.sender == token) would otherwise
         // be a valid call.
+        vm.prank(MINER);
+        m.approveBacker(address(re));
         re.mint(address(re), 1_000e18);
         vm.startPrank(address(re));
         re.approve(address(m), type(uint256).max);
@@ -349,6 +351,7 @@ contract PrefundedMiningPowerHostileTest is PrefundedMiningStack {
     // ------------------------------------------------------------------
 
     function testDonationsNeverCreditedOrPayable() public {
+        _approve(MINER, ALICE);
         _deposit(ALICE, 1_000e18);
         _assign(ALICE, MINER, 300e18);
 
@@ -394,6 +397,7 @@ contract PrefundedMiningPowerHostileTest is PrefundedMiningStack {
         _detach();
         _deployModule(LOCK, LOCK, COOLDOWN, 0, GUARDIAN);
         _attach(module);
+        _approve(MINER, ALICE);
         _deposit(ALICE, 1_000e18);
         _assign(ALICE, MINER, 400e18);
         vm.warp(block.timestamp + COOLDOWN);
@@ -476,6 +480,10 @@ contract PrefundedMiningPowerHostileTest is PrefundedMiningStack {
         _detach();
         _attach(m);
 
+        vm.prank(address(re));
+        m.approveBacker(ALICE);
+        vm.prank(BOB);
+        m.approveBacker(FUNDER);
         re.mint(address(re), 1_000e18);
         vm.startPrank(address(re));
         re.approve(address(m), type(uint256).max);
@@ -545,6 +553,7 @@ contract PrefundedMiningPowerHostileTest is PrefundedMiningStack {
     /// @dev Any total bumped past the balance blocks the claim (Insolvency)
     /// and leaves the lock claimable; honest totals let it pay.
     function testCorruptedTotalCommittedBlocksClaim() public {
+        _approve(MINER, ALICE);
         _deposit(ALICE, 1_000e18);
         _assign(ALICE, MINER, LOCK + 5e18);
         _nextChallenge();
@@ -586,6 +595,8 @@ contract PrefundedMiningPowerHostileTest is PrefundedMiningStack {
         PrefundedMiningPower m = _hostileModule(address(bad));
         _detach();
         _attach(m);
+        vm.prank(MINER);
+        m.approveBacker(ALICE);
         bad.mint(ALICE, LOCK);
         vm.startPrank(ALICE);
         bad.approve(address(m), LOCK);

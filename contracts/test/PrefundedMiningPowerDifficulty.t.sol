@@ -360,6 +360,8 @@ contract PrefundedMiningPowerDifficultyTest is Test {
     function _stakeFor(PrefundedMiningPower m, address wallet, uint256 amount) private {
         address backer = address(uint160(uint256(keccak256(abi.encode("difficulty backer", wallet)))));
         deal(address(token), backer, amount, true);
+        vm.prank(wallet);
+        m.approveBacker(backer); // S8b: the wallet consents to its backer
         vm.startPrank(backer);
         token.approve(address(m), amount);
         m.deposit(amount);

@@ -181,8 +181,10 @@ Fix: in `disableRequirement`, set `holdWaivedEpoch = latestChallengeId`, as
 `onMiningPowerDetached` does. Alternatively, skip `removingOf` in `_maturedStake` when
 `gateDisabled`.
 
-**F2 — Under the SPEC.md rules, a lock can be paid from stake that did not count. Already fixed
-in the contract by S8 decision 9; confirmed by TLC.**
+**F2 — Under the SPEC.md rules, a lock can be paid from stake that did not count. Fixed in the
+contract by S8 decision 9 only in the narrower sense that a DIFFERENT backer never pays for a win
+admitted on the previous backer's removed stake; confirmed by TLC for the modelled amounts. The
+same backer's partial removal plus re-assign is not covered (review #7, below).**
 
 With `S8Rules = FALSE` (`checks/LockFromCountingStake.cfg`, 11 states):
 
@@ -197,6 +199,16 @@ With a second depositor d2 in step 4, this is the old
 `testLimitation_NewBackerPaysWinAdmittedOnRemovedStake`: d2 pays for a win it did not qualify.
 With `S8Rules = TRUE`, `LockFromCountingStake` holds in M1 and M2 (`WalletHasCountingRemoval`
 refuses step 4, including for the same depositor).
+
+Scope of that result (independent review #7): `WalletHasCountingRemoval` only guards an EMPTY
+slot. A backer that removes only PART of its matured stake keeps the slot and may re-assign held
+stake to the same wallet as a pending top-up; a win admitted on the frozen stake (which still
+includes the removal) then consumes that pending top-up with the rest of the live stake (e.g.
+minimum 1,000, lock 100: remove 950 of 1,000, re-assign 50, win: the whole live 100 is locked).
+Per the review, the model's amounts do not cover partial live balances below `LOCK_PER_MINT`,
+so `LockFromCountingStake` passing does NOT mean held stake can never be locked. What
+is established is narrower: a DIFFERENT backer never pays for a win admitted on the previous
+backer's removed stake, and every lock is full-sized and charged to the wallet's current backer.
 
 **F3 — A two-transaction cutover has an ungated window. Operational: the core does not enforce
 the safe ordering.**

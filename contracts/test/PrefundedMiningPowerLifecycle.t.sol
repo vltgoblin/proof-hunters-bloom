@@ -48,6 +48,7 @@ contract PrefundedMiningPowerLifecycleTest is PrefundedMiningStack {
     /// @dev An expired-seed refresh opens the next challenge on the module
     /// (stake matures, holds lift) without any lock, note or proof count.
     function testSeedRefreshOpensEpochWithoutLock() public {
+        _approve(MINER, ALICE);
         _deposit(ALICE, MIN_STAKE);
         _assign(ALICE, MINER, MIN_STAKE);
         uint256 open = module.latestChallengeId();
@@ -198,6 +199,7 @@ contract PrefundedMiningPowerLifecycleTest is PrefundedMiningStack {
         _qualify(ALICE, MINER, MIN_STAKE + LOCK);
         uint256 tokenId = _win(MINER);
         _activate();
+        _approve(MINER2, BOB);
         _deposit(BOB, MIN_STAKE);
         _assign(BOB, MINER2, MIN_STAKE);
         vm.warp(block.timestamp + COOLDOWN);
@@ -336,6 +338,7 @@ contract PrefundedMiningPowerLifecycleTest is PrefundedMiningStack {
         _qualify(BOB, MINER2, MIN_STAKE); // matured by a refresh
         uint256 tB = module.assignTimestamp(BOB);
         uint256 t0 = block.timestamp;
+        _approve(MINER, ALICE);
         _deposit(ALICE, MIN_STAKE);
         _assign(ALICE, MINER, MIN_STAKE); // pending in the open challenge
 
@@ -391,6 +394,7 @@ contract PrefundedMiningPowerLifecycleTest is PrefundedMiningStack {
         // (2) The live module: ALICE pending, BOB matured, then a
         // non-terminal detach.
         module = live;
+        _approve(MINER, ALICE);
         _deposit(ALICE, MIN_STAKE);
         _assign(ALICE, MINER, MIN_STAKE);
         _qualify(BOB, MINER2, MIN_STAKE);
@@ -568,6 +572,7 @@ contract PrefundedMiningPowerLifecycleTest is PrefundedMiningStack {
     // ------------------------------------------------------------------
 
     function testFirstAssignMustReachMinStake() public {
+        _approve(MINER, BOB);
         _deposit(BOB, 2 * MIN_STAKE);
         uint256[3] memory tooSmall = [uint256(1), LOCK, MIN_STAKE - 1];
         for (uint256 i = 0; i < tooSmall.length; i++) {
@@ -666,13 +671,26 @@ contract PrefundedMiningPowerLifecycleTest is PrefundedMiningStack {
         assertEq(module.unassignedOf(CAROL), MIN_STAKE + 1);
         assertEq(module.heldBy(CAROL), MIN_STAKE);
         assertEq(module.heldStakeOf(CAROL), MIN_STAKE);
-        assertEq(module.withdrawableOf(CAROL), 1);
+        // S8b: the eviction keeps CAROL's own cooldown (restarted by her
+        // one-wei top-up at `t`) on her withdrawals — even the pending wei.
+        assertEq(module.withdrawLockedUntil(CAROL), t + COOLDOWN);
+        assertEq(module.withdrawableOf(CAROL), 0);
+        vm.prank(CAROL);
+        vm.expectRevert(abi.encodeWithSelector(PrefundedMiningPower.CooldownNotMet.selector, t + COOLDOWN, t));
+        module.withdraw(1);
         // The evicted matured stake still counts this challenge (frozen), but
         // nothing live is left to pay a lock: reason 4.
         _assertEligibility(MINER, false, 4, MIN_STAKE);
         _assertBooks();
 
-        // Same challenge: no new backer while that removal counts.
+        // S8b: evicting CAROL revoked her standing approval.
+        assertEq(module.approvedBackerOf(MINER), address(0));
+        // Same challenge: no new backer while that removal counts — even one
+        // the wallet has approved (S8b).
+        vm.prank(ALICE);
+        vm.expectRevert(abi.encodeWithSelector(PrefundedMiningPower.BackerNotApproved.selector, MINER, address(0)));
+        module.assign(MINER, MIN_STAKE);
+        _approve(MINER, ALICE);
         vm.prank(ALICE);
         vm.expectRevert(abi.encodeWithSelector(PrefundedMiningPower.WalletHasCountingRemoval.selector, MIN_STAKE));
         module.assign(MINER, MIN_STAKE);
@@ -681,6 +699,9 @@ contract PrefundedMiningPowerLifecycleTest is PrefundedMiningStack {
         _nextChallenge();
         _activate();
         assertEq(cid, c + 1);
+        assertEq(module.withdrawableOf(CAROL), 0); // hold gone, cooldown not
+        vm.warp(t + COOLDOWN);
+        assertEq(module.withdrawableOf(CAROL), MIN_STAKE + 1);
         _withdraw(CAROL, MIN_STAKE + 1);
         _assign(ALICE, MINER, MIN_STAKE);
         assertEq(module.backerOf(MINER), ALICE);
@@ -725,6 +746,7 @@ contract PrefundedMiningPowerLifecycleTest is PrefundedMiningStack {
         _qualify(ALICE, MINER, MIN_STAKE);
         vm.warp(block.timestamp + COOLDOWN);
         _unassign(ALICE, MINER, MIN_STAKE - 1);
+        _approve(MINER2, BOB);
         _deposit(BOB, MIN_STAKE);
         _assign(BOB, MINER2, MIN_STAKE);
 
@@ -765,13 +787,17 @@ contract PrefundedMiningPowerLifecycleTest is PrefundedMiningStack {
         _deposit(BOB, MIN_STAKE);
         bytes memory counting =
             abi.encodeWithSelector(PrefundedMiningPower.WalletHasCountingRemoval.selector, MIN_STAKE);
+        // S8b: the wallet's approval does not override the rule.
+        _approve(MINER, BOB);
         vm.prank(BOB);
         vm.expectRevert(counting);
         module.assign(MINER, MIN_STAKE);
+        _approve(MINER, ALICE);
         vm.prank(ALICE);
         vm.expectRevert(counting);
         module.assign(MINER, MIN_STAKE);
         // Another wallet is unaffected.
+        _approve(MINER2, BOB);
         _assign(BOB, MINER2, MIN_STAKE);
         vm.warp(block.timestamp + COOLDOWN);
         _unassign(BOB, MINER2, MIN_STAKE); // pending: nothing counts
@@ -788,6 +814,7 @@ contract PrefundedMiningPowerLifecycleTest is PrefundedMiningStack {
         _nextChallenge();
         _activate();
         assertEq(cid, c + 1);
+        _approve(MINER, BOB);
         _assign(BOB, MINER, MIN_STAKE);
         assertEq(module.backerOf(MINER), BOB);
         _nextChallenge();
@@ -803,6 +830,7 @@ contract PrefundedMiningPowerLifecycleTest is PrefundedMiningStack {
         vm.warp(block.timestamp + COOLDOWN);
         _unassign(CAROL, MINER2, MIN_STAKE);
         _unassign(BOB, MINER, MIN_STAKE - LOCK);
+        _approve(MINER2, ALICE);
         vm.prank(ALICE);
         vm.expectRevert(abi.encodeWithSelector(PrefundedMiningPower.WalletHasCountingRemoval.selector, MIN_STAKE));
         module.assign(MINER2, MIN_STAKE);
@@ -811,6 +839,337 @@ contract PrefundedMiningPowerLifecycleTest is PrefundedMiningStack {
         assertEq(module.holdWaivedEpoch(), module.latestChallengeId());
         _assign(ALICE, MINER2, MIN_STAKE);
         assertEq(module.backerOf(MINER2), ALICE);
+        _assertBooks();
+    }
+
+    // ------------------------------------------------------------------
+    // Backer consent (S8b, decision 8b)
+    // ------------------------------------------------------------------
+
+    /// @dev An empty slot needs the wallet's approval; a top-up by the
+    /// current backer does not (even with the approval cleared); a different
+    /// depositor is still refused while the slot is taken, approved or not.
+    function testApproveBackerRequiredForEmptySlot() public {
+        _deposit(ALICE, 2 * MIN_STAKE);
+        _deposit(BOB, MIN_STAKE);
+        assertEq(module.approvedBackerOf(MINER), address(0));
+        vm.prank(ALICE);
+        vm.expectRevert(abi.encodeWithSelector(PrefundedMiningPower.BackerNotApproved.selector, MINER, address(0)));
+        module.assign(MINER, MIN_STAKE);
+
+        vm.expectEmit(true, true, false, true, address(module));
+        emit PrefundedMiningPower.BackerApproved(MINER, ALICE);
+        _approve(MINER, ALICE);
+        assertEq(module.approvedBackerOf(MINER), ALICE);
+        // Only the named depositor: BOB is still refused on the empty slot.
+        vm.prank(BOB);
+        vm.expectRevert(abi.encodeWithSelector(PrefundedMiningPower.BackerNotApproved.selector, MINER, ALICE));
+        module.assign(MINER, MIN_STAKE);
+
+        _assign(ALICE, MINER, MIN_STAKE);
+        assertEq(module.backerOf(MINER), ALICE);
+        assertEq(module.assignedOf(MINER), MIN_STAKE);
+
+        // Top-up by the current backer: no approval needed, even cleared.
+        _approve(MINER, address(0));
+        _assign(ALICE, MINER, 1);
+        assertEq(module.assignedOf(MINER), MIN_STAKE + 1);
+        assertEq(module.backerOf(MINER), ALICE);
+
+        // A different depositor still gets WalletAlreadyBacked, approved or not.
+        vm.prank(BOB);
+        vm.expectRevert(abi.encodeWithSelector(PrefundedMiningPower.WalletAlreadyBacked.selector, ALICE));
+        module.assign(MINER, MIN_STAKE);
+        _approve(MINER, BOB);
+        vm.prank(BOB);
+        vm.expectRevert(abi.encodeWithSelector(PrefundedMiningPower.WalletAlreadyBacked.selector, ALICE));
+        module.assign(MINER, MIN_STAKE);
+        assertEq(module.assignedBy(BOB), 0);
+        _assertBooks();
+    }
+
+    /// @dev The approval can be changed before any stake arrives and cleared
+    /// (which blocks every new first assign); changing it while the wallet is
+    /// backed evicts nobody — it only decides who may take the slot once it
+    /// is empty again.
+    function testApproveBackerCanBeChangedAndCleared() public {
+        _deposit(ALICE, MIN_STAKE);
+        _deposit(BOB, MIN_STAKE);
+        _deposit(CAROL, MIN_STAKE);
+
+        _approve(MINER, ALICE);
+        _approve(MINER, BOB); // changed before any stake
+        vm.prank(ALICE);
+        vm.expectRevert(abi.encodeWithSelector(PrefundedMiningPower.BackerNotApproved.selector, MINER, BOB));
+        module.assign(MINER, MIN_STAKE);
+
+        vm.expectEmit(true, true, false, true, address(module));
+        emit PrefundedMiningPower.BackerApproved(MINER, address(0));
+        _approve(MINER, address(0)); // cleared: nobody may take the slot
+        assertEq(module.approvedBackerOf(MINER), address(0));
+        vm.prank(BOB);
+        vm.expectRevert(abi.encodeWithSelector(PrefundedMiningPower.BackerNotApproved.selector, MINER, address(0)));
+        module.assign(MINER, MIN_STAKE);
+
+        _approve(MINER, BOB);
+        _assign(BOB, MINER, MIN_STAKE);
+        // Changed while backed: BOB keeps the slot, his stake and his wins.
+        _approve(MINER, CAROL);
+        assertEq(module.backerOf(MINER), BOB);
+        assertEq(module.assignedOf(MINER), MIN_STAKE);
+        assertEq(module.assignedBy(BOB), MIN_STAKE);
+        _nextChallenge();
+        _activate();
+        _assertEligibility(MINER, true, 0, MIN_STAKE);
+        uint256 tokenId = _win(MINER);
+        (,,,, address backer,) = module.committedOf(tokenId);
+        assertEq(backer, BOB);
+
+        // Once BOB leaves, BOB himself may not come back (not approved any
+        // more); CAROL may, once his removal no longer counts.
+        _activate();
+        vm.warp(block.timestamp + COOLDOWN);
+        _unassign(BOB, MINER, MIN_STAKE - LOCK);
+        assertEq(module.backerOf(MINER), address(0));
+        vm.prank(BOB);
+        vm.expectRevert(abi.encodeWithSelector(PrefundedMiningPower.BackerNotApproved.selector, MINER, CAROL));
+        module.assign(MINER, MIN_STAKE - LOCK);
+        vm.prank(CAROL);
+        vm.expectRevert(
+            abi.encodeWithSelector(PrefundedMiningPower.WalletHasCountingRemoval.selector, MIN_STAKE - LOCK)
+        );
+        module.assign(MINER, MIN_STAKE);
+        _nextChallenge();
+        _assign(CAROL, MINER, MIN_STAKE);
+        assertEq(module.backerOf(MINER), CAROL);
+        _assertBooks();
+    }
+
+    /// @dev A wallet can never name itself (it could not back itself anyway),
+    /// and a refused call leaves the previous approval in place.
+    function testApproveBackerRejectsSelf() public {
+        vm.prank(MINER);
+        vm.expectRevert(PrefundedMiningPower.SelfAssignment.selector);
+        module.approveBacker(MINER);
+        assertEq(module.approvedBackerOf(MINER), address(0));
+        _approve(MINER, ALICE);
+        vm.prank(MINER);
+        vm.expectRevert(PrefundedMiningPower.SelfAssignment.selector);
+        module.approveBacker(MINER);
+        assertEq(module.approvedBackerOf(MINER), ALICE);
+    }
+
+    /// @dev Harmless in every state: after the failsafe, after retirement
+    /// and while detached the approval is recorded, moves nothing, and
+    /// entries stay refused for the state's own reason.
+    function testApproveBackerAllowedWhenRetiredOrDisabled() public {
+        _deposit(ALICE, MIN_STAKE);
+        uint256 base = vm.snapshotState();
+        uint256 bal = token.balanceOf(address(module));
+
+        vm.prank(GUARDIAN);
+        module.disableRequirement();
+        _approve(MINER, ALICE);
+        assertEq(module.approvedBackerOf(MINER), ALICE);
+        vm.prank(ALICE);
+        vm.expectRevert(PrefundedMiningPower.GateDisabled.selector);
+        module.assign(MINER, MIN_STAKE);
+        assertEq(token.balanceOf(address(module)), bal);
+
+        vm.revertToState(base);
+        vm.prank(STOP);
+        core.stopMining();
+        assertTrue(module.retired());
+        _approve(MINER, ALICE);
+        assertEq(module.approvedBackerOf(MINER), ALICE);
+        vm.prank(ALICE);
+        vm.expectRevert(PrefundedMiningPower.Retired.selector);
+        module.assign(MINER, MIN_STAKE);
+        assertEq(token.balanceOf(address(module)), bal);
+
+        vm.revertToState(base);
+        _detach();
+        _approve(MINER, ALICE);
+        vm.prank(ALICE);
+        vm.expectRevert(PrefundedMiningPower.NotWired.selector);
+        module.assign(MINER, MIN_STAKE);
+        // Re-attached, the standing approval is what lets ALICE in.
+        _attach(module);
+        _assign(ALICE, MINER, MIN_STAKE);
+        assertEq(module.backerOf(MINER), ALICE);
+        _assertBooks();
+    }
+
+    /// @dev Review #3's front-run is now impossible: CAROL (unsolicited)
+    /// races MINER's chosen backer ALICE for the empty slot with MIN_STAKE —
+    /// before and after MINER's approval — and is refused both times, so
+    /// ALICE's assign lands, CAROL can never pull stake from under MINER's
+    /// proof, and MINER's win is paid by ALICE.
+    function testSquatterCannotTakeSlotWithoutApproval() public {
+        _deposit(CAROL, MIN_STAKE);
+        _deposit(ALICE, MIN_STAKE);
+        vm.prank(CAROL);
+        vm.expectRevert(abi.encodeWithSelector(PrefundedMiningPower.BackerNotApproved.selector, MINER, address(0)));
+        module.assign(MINER, MIN_STAKE);
+
+        _approve(MINER, ALICE);
+        // CAROL front-runs ALICE's assign in the same block.
+        vm.prank(CAROL);
+        vm.expectRevert(abi.encodeWithSelector(PrefundedMiningPower.BackerNotApproved.selector, MINER, ALICE));
+        module.assign(MINER, MIN_STAKE);
+        _assign(ALICE, MINER, MIN_STAKE);
+        assertEq(module.backerOf(MINER), ALICE);
+        assertEq(module.assigneeOf(CAROL), address(0));
+
+        // After the cooldown CAROL has nothing on MINER to pull.
+        _nextChallenge();
+        _activate();
+        vm.warp(block.timestamp + COOLDOWN);
+        vm.prank(CAROL);
+        vm.expectRevert(abi.encodeWithSelector(PrefundedMiningPower.WrongAssignee.selector, address(0), MINER));
+        module.unassign(MINER, MIN_STAKE);
+        uint256 tokenId = _win(MINER);
+        (uint256 amount,,,, address backer,) = module.committedOf(tokenId);
+        assertEq(amount, LOCK);
+        assertEq(backer, ALICE);
+        _withdraw(CAROL, MIN_STAKE);
+        _assertBooks();
+    }
+
+    // ------------------------------------------------------------------
+    // Eviction keeps the backer's cooldown (S8b, review #6)
+    // ------------------------------------------------------------------
+
+    /// @dev Review #6's sequence: a win leaves ALICE below MIN_STAKE, a
+    /// one-wei pending top-up restarts her cooldown, and the wallet evicts
+    /// her at once. The slot is free immediately, but none of the returned
+    /// stake — not even the pending wei — can be withdrawn before the
+    /// cooldown the top-up started; the next snapshot lifts only the hold.
+    function testEvictedStakeKeepsBackerCooldown() public {
+        (uint256 t1, uint256 back) = _evictAfterTopUp();
+        assertEq(module.withdrawLockedUntil(ALICE), t1 + COOLDOWN);
+        assertEq(module.backerOf(MINER), address(0));
+        assertEq(module.assigneeOf(ALICE), address(0));
+        assertEq(module.unassignedOf(ALICE), back);
+        assertEq(module.heldStakeOf(ALICE), back - 1); // matured part, still counting
+        assertEq(module.withdrawableOf(ALICE), 0); // pending wei not free either
+        vm.prank(ALICE);
+        vm.expectRevert(abi.encodeWithSelector(PrefundedMiningPower.CooldownNotMet.selector, t1 + COOLDOWN, t1));
+        module.withdraw(1);
+        _assertBooks();
+
+        // The next snapshot lifts the hold, not the cooldown.
+        _nextChallenge();
+        assertEq(module.heldStakeOf(ALICE), 0);
+        assertEq(module.withdrawableOf(ALICE), 0);
+        vm.warp(t1 + COOLDOWN - 1);
+        vm.prank(ALICE);
+        vm.expectRevert(
+            abi.encodeWithSelector(PrefundedMiningPower.CooldownNotMet.selector, t1 + COOLDOWN, t1 + COOLDOWN - 1)
+        );
+        module.withdraw(1);
+        assertEq(module.withdrawableOf(ALICE), 0);
+        _assertBooks();
+
+        vm.warp(t1 + COOLDOWN);
+        assertEq(module.withdrawableOf(ALICE), back);
+        _withdraw(ALICE, back);
+        assertEq(token.balanceOf(ALICE), back);
+        assertEq(module.totalStake(), 0);
+        _assertBooks();
+    }
+
+    /// @dev Eviction revokes consent (S8b): evicting the approved backer
+    /// clears the wallet's approval (with a `BackerApproved(wallet, 0)`
+    /// event), so once the evicted removal stops counting ALICE's next first
+    /// assign is refused `BackerNotApproved`; a fresh approval lets her back
+    /// in. Evicting a backer that is no longer the approved one leaves the
+    /// current approval alone.
+    function testEvictClearsApproval() public {
+        (uint256 t1, uint256 back) = _evictAfterTopUp();
+        assertEq(module.approvedBackerOf(MINER), address(0));
+        _nextChallenge(); // the evicted removal no longer counts
+        _activate();
+        vm.warp(t1 + COOLDOWN);
+        vm.prank(ALICE);
+        vm.expectRevert(abi.encodeWithSelector(PrefundedMiningPower.BackerNotApproved.selector, MINER, address(0)));
+        module.assign(MINER, back);
+        _deposit(ALICE, MIN_STAKE);
+        vm.prank(ALICE);
+        vm.expectRevert(abi.encodeWithSelector(PrefundedMiningPower.BackerNotApproved.selector, MINER, address(0)));
+        module.assign(MINER, MIN_STAKE);
+        _approve(MINER, ALICE);
+        _assign(ALICE, MINER, MIN_STAKE);
+        assertEq(module.backerOf(MINER), ALICE);
+        _assertBooks();
+
+        // ALICE falls below the floor again after a win, but the wallet has
+        // meanwhile approved BOB: evicting ALICE keeps BOB's approval.
+        _nextChallenge();
+        _win(MINER);
+        _approve(MINER, BOB);
+        vm.expectEmit(true, true, false, true, address(module));
+        emit PrefundedMiningPower.BackerEvicted(MINER, ALICE, MIN_STAKE - LOCK);
+        vm.prank(MINER);
+        module.evictBacker(MINER);
+        assertEq(module.approvedBackerOf(MINER), BOB);
+        _assertBooks();
+    }
+
+    /// @dev Like the cooldown itself, the carried-over lock is waived once
+    /// the failsafe fires or the module retires: the evicted stake leaves at
+    /// the eviction's own timestamp.
+    function testEvictCooldownWaivedAfterRetirementOrFailsafe() public {
+        (uint256 t1, uint256 back) = _evictAfterTopUp();
+        uint256 base = vm.snapshotState();
+
+        vm.prank(GUARDIAN);
+        module.disableRequirement();
+        assertEq(block.timestamp, t1);
+        assertEq(module.withdrawLockedUntil(ALICE), t1 + COOLDOWN); // recorded, waived
+        assertEq(module.withdrawableOf(ALICE), back);
+        _withdraw(ALICE, back);
+        assertEq(token.balanceOf(ALICE), back);
+        _assertBooks();
+
+        vm.revertToState(base);
+        vm.prank(STOP);
+        core.stopMining();
+        assertTrue(module.retired());
+        assertEq(block.timestamp, t1);
+        assertEq(module.withdrawableOf(ALICE), back);
+        _withdraw(ALICE, back);
+        assertEq(token.balanceOf(ALICE), back);
+        _assertBooks();
+    }
+
+    /// @dev After the failsafe a value the gate froze earlier is lowered to
+    /// the live matured stake (S8b): at mint-out the final challenge's
+    /// freeze stays cached while its stake leaves the (retired) module; the
+    /// preview reports the stale cache until the failsafe fires, then only
+    /// what is still assigned. The gate's own `_freeze` lowers (and stores)
+    /// the same value; the real core never re-reads a cached freeze, so —
+    /// as in the Cutover rewire test — its read hook is called directly
+    /// (`vm.prank(core)`, read-only: no note, no lock).
+    function test_FailsafeLowersCachedFreeze() public {
+        _qualify(ALICE, MINER, MIN_STAKE + LOCK);
+        uint256 c = cid;
+        stdstore.target(address(core)).sig("nftsMintedEver()").checked_write(uint256(4_999));
+        stdstore.target(address(core)).sig("acceptedProofs()").checked_write(uint256(4_999));
+        stdstore.target(address(nft)).sig("mintedEver()").checked_write(uint256(4_999));
+        _win(MINER); // mint-out: retired, cache MIN_STAKE + LOCK kept
+        assertTrue(module.retired());
+        _assertEligibility(MINER, false, 1, MIN_STAKE + LOCK);
+        _unassign(ALICE, MINER, MIN_STAKE - 1);
+        _withdraw(ALICE, MIN_STAKE - 1);
+        _assertEligibility(MINER, false, 1, MIN_STAKE + LOCK); // stale cache
+        vm.prank(GUARDIAN);
+        module.disableRequirement();
+        _assertEligibility(MINER, false, 1, 1);
+        assertEq(module.assignedOf(MINER), 1);
+        vm.prank(address(core));
+        assertEq(module.snapshottedLockedAmount(c, MINER), 1);
+        _assertEligibility(MINER, false, 1, 1);
         _assertBooks();
     }
 
@@ -852,10 +1211,12 @@ contract PrefundedMiningPowerLifecycleTest is PrefundedMiningStack {
         assertEq(module.backerOf(MINER2), address(0));
         _assertEligibility(MINER2, false, 4, MIN_STAKE);
 
-        // After the failsafe no lock is taken, so reason 4 no longer applies.
+        // After the failsafe no lock is taken, so reason 4 no longer applies;
+        // and (S8b, TLA+ F1) the removal no longer counts either — BOB's
+        // stake may leave at once, so the reported stake is the live 0.
         vm.prank(GUARDIAN);
         module.disableRequirement();
-        _assertEligibility(MINER2, true, 0, MIN_STAKE);
+        _assertEligibility(MINER2, true, 0, 0);
         _assertBooks();
     }
 
@@ -923,6 +1284,7 @@ contract PrefundedMiningPowerLifecycleTest is PrefundedMiningStack {
         assertTrue(_isApproved(PrefundedMiningPower.claimCommittedTo.selector));
         assertTrue(_isApproved(PrefundedMiningPower.disableRequirement.selector));
         assertTrue(_isApproved(PrefundedMiningPower.evictBacker.selector));
+        assertTrue(_isApproved(PrefundedMiningPower.approveBacker.selector));
         assertEq(token.balanceOf(address(module)), bal);
     }
 
@@ -1022,6 +1384,28 @@ contract PrefundedMiningPowerLifecycleTest is PrefundedMiningStack {
         assertEq(module.unassignedOf(who), before);
     }
 
+    /// @dev Review #6 setup: ALICE backs MINER with MIN_STAKE, one win takes
+    /// it below the floor, the old cooldown passes, a one-wei pending top-up
+    /// at `t1` restarts it, and MINER evicts her at `t1`. Returns `t1` and
+    /// the stake returned to ALICE (`MIN_STAKE - LOCK + 1`, all unassigned).
+    function _evictAfterTopUp() private returns (uint256 t1, uint256 back) {
+        _qualify(ALICE, MINER, MIN_STAKE);
+        _win(MINER);
+        _activate();
+        assertEq(module.assignedOf(MINER), MIN_STAKE - LOCK);
+        vm.warp(block.timestamp + COOLDOWN);
+        _deposit(ALICE, 1);
+        t1 = block.timestamp;
+        _assign(ALICE, MINER, 1);
+        back = MIN_STAKE - LOCK + 1;
+        assertEq(module.assignedOf(MINER), back);
+        vm.expectEmit(true, true, false, true, address(module));
+        emit PrefundedMiningPower.BackerApproved(MINER, address(0));
+        vm.prank(MINER);
+        module.evictBacker(MINER);
+        assertEq(module.assignedOf(MINER), 0);
+    }
+
     function _assertEligibility(address wallet, bool eligible, uint8 reason, uint256 stake) private view {
         (bool e, uint8 r, uint256 s) = module.eligibilityOf(wallet);
         assertEq(e, eligible, "eligible");
@@ -1053,9 +1437,9 @@ contract PrefundedMiningPowerLifecycleTest is PrefundedMiningStack {
         return false;
     }
 
-    /// @dev The approved external ABI of PrefundedMiningPower (S8).
+    /// @dev The approved external ABI of PrefundedMiningPower (S8b).
     function _loadApproved() private {
-        string[50] memory sigs = [
+        string[54] memory sigs = [
             // immutables
             "HUNTER()",
             "miningCore()",
@@ -1074,6 +1458,7 @@ contract PrefundedMiningPowerLifecycleTest is PrefundedMiningStack {
             "retired()",
             "gateDisabled()",
             "holdWaivedEpoch()",
+            "rewiredEpoch()",
             // per-account ledger
             "unassignedOf(address)",
             "assignedOf(address)",
@@ -1088,6 +1473,8 @@ contract PrefundedMiningPowerLifecycleTest is PrefundedMiningStack {
             "removingOf(address)",
             "heldBy(address)",
             "heldEpochBy(address)",
+            "approvedBackerOf(address)",
+            "withdrawLockedUntil(address)",
             // Mining Core hooks (core only)
             "powerMultiplierWad(uint256,address)",
             "snapshottedLockedAmount(uint256,address)",
@@ -1099,6 +1486,7 @@ contract PrefundedMiningPowerLifecycleTest is PrefundedMiningStack {
             "assign(address,uint256)",
             "unassign(address,uint256)",
             "evictBacker(address)",
+            "approveBacker(address)",
             "withdraw(uint256)",
             "claimCommitted(uint256)",
             "claimCommittedTo(uint256,address)",

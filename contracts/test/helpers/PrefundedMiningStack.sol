@@ -352,6 +352,14 @@ abstract contract PrefundedMiningStack is Test {
         vm.stopPrank();
     }
 
+    /// @dev `wallet` consents to `backer` taking its empty backer slot
+    /// (S8b, decision 8b; address(0) clears the approval).
+    function _approve(address wallet, address backer) internal {
+        _trackWallet(wallet);
+        vm.prank(wallet);
+        module.approveBacker(backer);
+    }
+
     function _assign(address who, address wallet, uint256 amt) internal {
         _trackDepositor(who);
         _trackWallet(wallet);
@@ -385,8 +393,10 @@ abstract contract PrefundedMiningStack is Test {
     /// @dev `depositor` deposits `stake` and assigns it to `wallet`; the next
     /// challenge is then opened (via `_nextChallenge`, so no pre-existing
     /// eligible miner is needed) and activated, so the stake has matured and
-    /// `wallet` can mine immediately. The module must be attached.
+    /// `wallet` can mine immediately. The module must be attached. The wallet
+    /// first approves `depositor` as its backer (S8b, decision 8b).
     function _qualify(address depositor, address wallet, uint256 stake) internal {
+        _approve(wallet, depositor);
         _deposit(depositor, stake);
         _assign(depositor, wallet, stake);
         _nextChallenge();
@@ -453,9 +463,15 @@ abstract contract PrefundedMiningStack is Test {
             uint256 held = module.heldStakeOf(d);
             assertLe(held, module.unassignedOf(d) + module.assignedBy(d), "held stake left the module");
             assertLe(module.withdrawableOf(d), module.unassignedOf(d), "withdrawable > unassigned");
+            // S8b: an eviction's carried-over cooldown blocks every withdrawal
+            // (waived once retired or after the failsafe).
+            bool evictLocked =
+                !module.retired() && !module.gateDisabled() && block.timestamp < module.withdrawLockedUntil(d);
             assertEq(
                 module.withdrawableOf(d),
-                module.unassignedOf(d) - (held < module.unassignedOf(d) ? held : module.unassignedOf(d)),
+                evictLocked
+                    ? 0
+                    : module.unassignedOf(d) - (held < module.unassignedOf(d) ? held : module.unassignedOf(d)),
                 "withdrawable != unassigned - held"
             );
             if (module.assignedBy(d) == 0) assertEq(module.assigneeOf(d), address(0), "dangling assignee");

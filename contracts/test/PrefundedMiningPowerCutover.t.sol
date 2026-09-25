@@ -127,6 +127,7 @@ contract PrefundedMiningPowerCutoverTest is PrefundedMiningStack {
         _send(OLD_MATURED_WALLET, n);
 
         // A qualified wallet mines from the next snapshot, with a lock.
+        _approve(MINER, ALICE);
         _assign(ALICE, MINER, MIN);
         (n,) = _nonce(MINER);
         _expectNotEligible(2); // pending in the challenge the attach opened
@@ -220,6 +221,7 @@ contract PrefundedMiningPowerCutoverTest is PrefundedMiningStack {
         assertEq(module.latestChallengeId(), c);
 
         // Assigned right after the attach, same challenge: pending.
+        _approve(MINER, ALICE);
         _assign(ALICE, MINER, MIN);
         assertEq(module.pendingOf(MINER), MIN);
         (bool eligible, uint8 reason, uint256 stake) = module.eligibilityOf(MINER);
@@ -424,6 +426,7 @@ contract PrefundedMiningPowerCutoverTest is PrefundedMiningStack {
         _qualify(ALICE, MINER, MIN + LOCK);
         uint256 locked = _win(MINER);
         vm.warp(block.timestamp + COOLDOWN);
+        _approve(MINER2, BOB);
         _deposit(BOB, MIN);
         _assign(BOB, MINER2, MIN); // fresh assign: BOB's cooldown runs
         uint256 bobEarliest = block.timestamp + COOLDOWN;
@@ -621,6 +624,8 @@ contract PrefundedMiningPowerCutoverTest is PrefundedMiningStack {
         // bug the fix closes: the stale MIN cache would admit MINER and her
         // pending stake would pay its lock); BOB stakes MINER2, whose cached
         // 0 must NOT be raised.
+        _approve(MINER, CAROL);
+        _approve(MINER2, BOB);
         _deposit(CAROL, MIN);
         _assign(CAROL, MINER, MIN);
         _deposit(BOB, 2 * MIN);

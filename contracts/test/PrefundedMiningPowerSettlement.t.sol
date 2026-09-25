@@ -434,6 +434,8 @@ contract PrefundedMiningPowerSettlementTest is PrefundedMiningStack {
         // Challenge scheduled but seed not yet readable (WAITING_FOR_SEED).
         _nextChallenge();
         assertEq(uint8(core.challengeState()), uint8(HunterMiningCore.ChallengeState.WAITING_FOR_SEED));
+        _approve(MINER2, BOB);
+        _approve(MINER, ALICE);
         _deposit(BOB, MIN_STAKE);
         _assign(BOB, MINER2, MIN_STAKE);
         // Challenge ACTIVE (seed readable).
@@ -473,6 +475,7 @@ contract PrefundedMiningPowerSettlementTest is PrefundedMiningStack {
         SettlementMiner miner = new SettlementMiner();
         SameTxStaker funder = new SameTxStaker(IERC20(address(token)), module);
         token.mint(address(funder), MIN_STAKE);
+        _approve(address(miner), address(funder));
         _activate();
         (uint256 nonce,) = _nonce(address(miner));
 
@@ -506,6 +509,7 @@ contract PrefundedMiningPowerSettlementTest is PrefundedMiningStack {
         token.mint(address(lender), MIN_STAKE);
         SettlementFlashStaker borrower =
             new SettlementFlashStaker(IERC20(address(token)), module, address(lender), miner, core, basket);
+        _approve(address(miner), address(borrower));
         _activate();
         (uint256 nonce,) = _nonce(address(miner));
 
@@ -523,6 +527,7 @@ contract PrefundedMiningPowerSettlementTest is PrefundedMiningStack {
         _attach(module);
         _activate();
         borrower = new SettlementFlashStaker(IERC20(address(token)), module, address(lender), miner, core, basket);
+        _approve(address(miner), address(borrower));
         (nonce,) = _nonce(address(miner));
         borrower.configure(cid, seed, nonce, true);
         vm.expectRevert(
@@ -545,6 +550,7 @@ contract PrefundedMiningPowerSettlementTest is PrefundedMiningStack {
         _assertEligibility(MINER, true, 0, MIN_STAKE);
 
         _unassign(ALICE, MINER, MIN_STAKE);
+        _approve(MINER2, ALICE);
         _assign(ALICE, MINER2, MIN_STAKE);
         // S8 reason 4: frozen MIN_STAKE still admits, the live stake is 0.
         _assertEligibility(MINER, false, 4, MIN_STAKE);
@@ -582,6 +588,8 @@ contract PrefundedMiningPowerSettlementTest is PrefundedMiningStack {
         PrefundedMiningPower m =
             new PrefundedMiningPower(address(brick), address(core), MIN_STAKE, LOCK, 0, 0, address(0));
         _attach(m);
+        vm.prank(MINER);
+        m.approveBacker(ALICE);
         brick.mint(ALICE, MIN_STAKE);
         vm.startPrank(ALICE);
         brick.approve(address(m), MIN_STAKE);
@@ -681,6 +689,8 @@ contract PrefundedMiningPowerSettlementTest is PrefundedMiningStack {
             new PrefundedMiningPower(address(token), address(probeCore), LOCK, LOCK, 0, 0, address(0));
         // Staked in challenge 6, so it counts in challenge 7.
         probeCore.open(m, 6);
+        vm.prank(MINER);
+        m.approveBacker(ALICE);
         token.mint(ALICE, LOCK);
         vm.startPrank(ALICE);
         token.approve(address(m), LOCK);
@@ -752,6 +762,7 @@ contract PrefundedMiningPowerSettlementTest is PrefundedMiningStack {
     function testFuzz_PreviewMatchesGate(uint256 stakeSeed, bool matured, uint256 topUpSeed) public {
         uint256 amount = bound(stakeSeed, 0, 2 * MIN_STAKE);
         uint256 topUp = bound(topUpSeed, 0, 3 * LOCK);
+        _approve(MINER, ALICE);
         if (amount != 0) {
             _deposit(ALICE, amount);
             if (amount < MIN_STAKE) {
@@ -826,6 +837,7 @@ contract PrefundedMiningPowerSettlementTest is PrefundedMiningStack {
         for (uint256 i = 0; i < 6; i++) {
             address depositor = address(uint160(0xD000 + i));
             wallets[i] = address(uint160(0xE000 + i));
+            _approve(wallets[i], depositor);
             _deposit(depositor, stakes[i]);
             _assign(depositor, wallets[i], stakes[i]);
             // Pending stake previews at 1.0x.
@@ -1067,17 +1079,30 @@ contract PrefundedMiningPowerSettlementTest is PrefundedMiningStack {
     }
 
     function testSecondBackerRejected() public {
-        // S8: the first assign must reach MIN_STAKE; top-ups need not.
+        // S8b: MINER consents to ALICE only — BOB cannot take the empty slot.
+        _approve(MINER, ALICE);
         _deposit(ALICE, MIN_STAKE + MIN_STAKE / 2);
+        _deposit(BOB, MIN_STAKE);
+        vm.prank(BOB);
+        vm.expectRevert(abi.encodeWithSelector(PrefundedMiningPower.BackerNotApproved.selector, MINER, ALICE));
+        module.assign(MINER, MIN_STAKE);
+        // S8: the first assign must reach MIN_STAKE; top-ups need not.
         _assign(ALICE, MINER, MIN_STAKE);
         assertEq(module.backerOf(MINER), ALICE);
-        _deposit(BOB, MIN_STAKE);
+        vm.prank(BOB);
+        vm.expectRevert(abi.encodeWithSelector(PrefundedMiningPower.WalletAlreadyBacked.selector, ALICE));
+        module.assign(MINER, MIN_STAKE);
+        // Approving BOB while ALICE backs the wallet evicts nobody: the slot
+        // is still ALICE's.
+        _approve(MINER, BOB);
         vm.prank(BOB);
         vm.expectRevert(abi.encodeWithSelector(PrefundedMiningPower.WalletAlreadyBacked.selector, ALICE));
         module.assign(MINER, MIN_STAKE);
 
-        // The backer itself tops up freely; BOB backs another wallet.
+        // The backer itself tops up freely (no approval needed any more);
+        // BOB backs another wallet.
         _assign(ALICE, MINER, MIN_STAKE / 2);
+        _approve(MINER2, BOB);
         _assign(BOB, MINER2, MIN_STAKE);
         assertEq(module.assignedOf(MINER), MIN_STAKE + MIN_STAKE / 2);
         assertEq(module.backerOf(MINER2), BOB);
@@ -1127,6 +1152,8 @@ contract PrefundedMiningPowerSettlementTest is PrefundedMiningStack {
         assertEq(module.totalCommitted(), LOCK);
         _assertBooks();
 
+        _approve(MINER, BOB);
+        _approve(MINER2, ALICE);
         _deposit(BOB, LOCK);
         _assign(BOB, MINER, LOCK);
         _deposit(ALICE, LOCK);
@@ -1255,6 +1282,8 @@ contract PrefundedMiningPowerSettlementTest is PrefundedMiningStack {
         vm.prank(STOP);
         c2.setMiningPower(m);
 
+        vm.prank(MINER);
+        m.approveBacker(ALICE);
         token.mint(ALICE, MIN_STAKE);
         vm.startPrank(ALICE);
         token.approve(address(m), MIN_STAKE);
@@ -1308,6 +1337,7 @@ contract PrefundedMiningPowerSettlementTest is PrefundedMiningStack {
     }
 
     function testCopiedNonceOtherWalletNoLock() public {
+        _approve(MINER2, BOB);
         _deposit(BOB, MIN_STAKE);
         _assign(BOB, MINER2, MIN_STAKE);
         _qualify(ALICE, MINER, MIN_STAKE);
@@ -1363,6 +1393,7 @@ contract PrefundedMiningPowerSettlementTest is PrefundedMiningStack {
         _assertBooks();
 
         // The first real win after attach is the first lock.
+        _approve(MINER, ALICE);
         _assign(ALICE, MINER, MIN_STAKE);
         _nextChallenge();
         uint256 tokenId = _win(MINER);
@@ -1374,6 +1405,7 @@ contract PrefundedMiningPowerSettlementTest is PrefundedMiningStack {
     }
 
     function testLockBindsToMintedIdDigestChallenge() public {
+        _approve(MINER2, BOB);
         _deposit(BOB, MIN_STAKE);
         _assign(BOB, MINER2, MIN_STAKE);
         _qualifyFor(ALICE, MINER, 2);
@@ -1511,6 +1543,8 @@ contract PrefundedMiningPowerSettlementTest is PrefundedMiningStack {
         fc = new ForeignSequenceCore();
         m = new PrefundedMiningPower(address(token), address(fc), LOCK, LOCK, 0, 0, address(0));
         token.mint(address(fc), LOCK);
+        vm.prank(MINER);
+        m.approveBacker(address(fc));
         err = fc.gateChallengeZero(m, IERC20(address(token)), 5, MINER);
         assertEq(err, abi.encodeWithSelector(PrefundedMiningPower.ChallengeNotOpen.selector, 0));
 
@@ -1650,6 +1684,7 @@ contract PrefundedMiningPowerSettlementTest is PrefundedMiningStack {
     /// forge-config: default.fuzz.runs = 64
     /// forge-config: release.fuzz.runs = 64
     function testFuzz_LockKeepsPendingWithinBalance(uint256 fuzzSeed) public {
+        _approve(MINER, ALICE);
         _deposit(ALICE, MIN_STAKE);
         _assign(ALICE, MINER, MIN_STAKE);
         uint256 wins;
@@ -1825,12 +1860,14 @@ contract PrefundedMiningPowerSettlementTest is PrefundedMiningStack {
     function _measuredWin(uint256 backing, uint256 idle) private returns (uint256 used) {
         for (uint256 i = 0; i < backing; i++) {
             address d = address(uint160(0xD0000 + i));
+            _approve(address(uint160(0xE0000 + i)), d);
             _deposit(d, MIN_STAKE);
             _assign(d, address(uint160(0xE0000 + i)), MIN_STAKE);
         }
         for (uint256 i = 0; i < idle; i++) {
             _deposit(address(uint160(0xF0000 + i)), MIN_STAKE);
         }
+        _approve(MINER, ALICE);
         _deposit(ALICE, MIN_STAKE);
         _assign(ALICE, MINER, MIN_STAKE);
         _nextChallenge();
@@ -1850,6 +1887,8 @@ contract PrefundedMiningPowerSettlementTest is PrefundedMiningStack {
         fc = new ForeignSequenceCore();
         m = new PrefundedMiningPower(address(token), address(fc), LOCK, LOCK, 0, 0, address(0));
         token.mint(address(fc), stake);
+        vm.prank(MINER);
+        m.approveBacker(address(fc));
         fc.openAndStake(m, IERC20(address(token)), 6, MINER, stake);
     }
 

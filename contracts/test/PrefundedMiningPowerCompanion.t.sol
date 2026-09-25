@@ -478,6 +478,8 @@ contract PrefundedMiningPowerCompanionTest is PrefundedMiningStack {
         PrefundedMiningPower m = new PrefundedMiningPower(address(tax), address(core), MIN_STAKE, LOCK, 0, 0, address(0));
         _detach();
         _attach(m);
+        vm.prank(MINER);
+        m.approveBacker(ALICE);
         tax.mint(ALICE, MIN_STAKE);
         vm.startPrank(ALICE);
         tax.approve(address(m), MIN_STAKE);
