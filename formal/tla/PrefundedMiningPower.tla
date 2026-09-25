@@ -1,7 +1,7 @@
 ------------------------- MODULE PrefundedMiningPower -------------------------
 (***************************************************************************)
 (* TLA+ model of HunterMiningCore + PrefundedMiningPower (Linear VLT-65,   *)
-(* slice S10b). It models the RULES of the build spec (SPEC.md: Hooks,     *)
+(* slice S10b, updated for the S8b contract). It models the RULES of the build spec (SPEC.md: Hooks,     *)
 (* Stake ledger, OWNER DECISION 2026-09-25 "SINGLE BUCKET", Release,       *)
 (* Failsafe) and the core wiring rules of HunterMiningCore.sol.            *)
 (*                                                                         *)
@@ -14,13 +14,17 @@
 (*  - the wall-clock EXIT_COOLDOWN is abstracted to "always elapsed":      *)
 (*    unassign is never blocked by time. Every cooldown-respecting         *)
 (*    behaviour is a behaviour of this model, so safety results carry over;*)
+(*    the S8b eviction withdraw lock (withdrawLockedUntil) is kept as a    *)
+(*    boolean withdrawLocked[d], set by evictBacker and cleared by the     *)
+(*    explicit CooldownElapses(d) step (any time later);                   *)
 (*  - PoW, digests, targets, tiers, baskets and the bonus curve value are  *)
 (*    abstracted: any miner may win an ACTIVE challenge (nondeterminism);  *)
 (*  - challenge ids are real naturals; the VIEW (ViewMap) canonicalises    *)
 (*    them relative to latestChallengeId so the state graph is finite     *)
 (*    (every comparison the contract makes is "== latest" / "< latest").   *)
 (*  - Depositors and Wallets are disjoint, so the SelfAssignment rule is   *)
-(*    vacuous here (it is covered by testSelfAssignmentRule).              *)
+(*    vacuous here (it is covered by testSelfAssignmentRule), and so is    *)
+(*    approveBacker's self-approval check (SelfAssignment).                *)
 (*  - The old MiningPowerCustody ("Old") is abstract: it never gates, and  *)
 (*    only its RetainedAssignments rule is kept (oldRetained).             *)
 (***************************************************************************)
@@ -43,6 +47,13 @@ CONSTANTS
                     \* backer while a removal still counts (decision 9,
                     \* WalletHasCountingRemoval), evictBacker, and deposit
                     \* refused once retired / failsafe fired
+    , S8bRules      \* TRUE (requires S8Rules): + S8b hardening now in the contract:
+                    \* backer consent (approveBacker; an EMPTY slot is taken only
+                    \* by approvedBackerOf[w], BackerNotApproved), the failsafe
+                    \* never counts removals (_maturedStake ignores removingOf when
+                    \* gateDisabled, disableRequirement records holdWaivedEpoch,
+                    \* cached freezes are lowered), and evictBacker carries the
+                    \* backer's cooldown over to its withdrawals (withdrawLocked)
     , CoreChurn     \* TRUE: old custody, stop sunset and late attach are modelled.
                     \* FALSE (ledger runs): power in {None, New} only and no
                     \* sunset. The module cannot tell Old from None and the
@@ -54,6 +65,7 @@ ASSUME /\ Lock > 0 /\ MinStake >= Lock          \* constructor: minStake_ >= loc
        /\ Depositors \cap Wallets = {}
        /\ CutoverMode \in {"batched", "twoTx"}
        /\ CurveEnabled \in BOOLEAN /\ S8Rules \in BOOLEAN /\ CoreChurn \in BOOLEAN
+       /\ S8bRules \in BOOLEAN /\ (S8bRules => S8Rules)
 
 Tokens   == 1..MaxTokens
 Holders  == Wallets \cup {Buyer}
@@ -81,6 +93,8 @@ VARIABLES
     pendingOf, pendingEpoch, pendingBy, pendingEpochBy,
     removing, heldBy, heldEpochBy,
     frozenEpoch, frozenVal,        \* _frozen/_frozenStake (last freeze per wallet)
+    approvedBacker,                \* approvedBackerOf[w] (S8b; NoD = none)
+    withdrawLocked,                \* block.timestamp < withdrawLockedUntil[d] (S8b)
     totalStake, totalAssigned, totalCommitted,
     balance,                       \* HUNTER.balanceOf(module)
     lock,                          \* _committed[tokenId]
@@ -100,13 +114,15 @@ modVars    == <<wired, retired, gateDisabled, latest, holdWaived>>
 ledgerVars == <<unassigned, assignedOf, assignedBy, assignee, backer,
                 pendingOf, pendingEpoch, pendingBy, pendingEpochBy,
                 removing, heldBy, heldEpochBy>>
+s8bVars    == <<approvedBacker, withdrawLocked>>
 freezeVars == <<frozenEpoch, frozenVal>>
 bookVars   == <<totalStake, totalAssigned, totalCommitted, balance, lock>>
 nftVars    == <<owner, beneficiary>>
 ghostVars  == <<netIn, gated, lockWrites, releaseCount, releasedTo, remBy, remEpoch>>
 gapVars    == <<inGap, gapAllWaiting, gapSubmit, ungatedCutover, ungatedCutoverInWaiting>>
 baseVars   == <<baseEpoch, baseline, rewiredSame>>
-vars == <<coreVars, modVars, ledgerVars, freezeVars, bookVars, nftVars, ghostVars, gapVars, baseVars>>
+vars == <<coreVars, modVars, ledgerVars, freezeVars, bookVars, nftVars, ghostVars, gapVars, baseVars,
+          s8bVars>>
 
 NoLock == [amount |-> 0, miner |-> NoW, backer |-> NoD, released |-> FALSE, fromMatured |-> TRUE]
 
@@ -124,16 +140,27 @@ PendOfCur(w) == IF pendingEpoch[w] = latest THEN pendingOf[w] ELSE 0
 RemCur(w)    == IF pendingEpoch[w] = latest THEN removing[w] ELSE 0
 PendByCur(d) == IF pendingEpochBy[d] = latest THEN pendingBy[d] ELSE 0
 
+\* S8b: after the failsafe, removals never count again (any challenge)
+RemovalsCount == latest # holdWaived /\ ~(S8bRules /\ gateDisabled)
+
 \* _maturedStake(latest, w)
 Matured(w) ==
     IF pendingEpoch[w] = latest
-    THEN assignedOf[w] - pendingOf[w] + (IF latest # holdWaived THEN removing[w] ELSE 0)
+    THEN assignedOf[w] - pendingOf[w] + (IF RemovalsCount THEN removing[w] ELSE 0)
     ELSE assignedOf[w]
 
+\* a cached freeze for the latest epoch; S8b lowers it (never raises it) to the
+\* recomputed matured stake after the failsafe. (The S9 rewiredEpoch re-freeze
+\* is not modelled separately: NoFreezeInOpenChallenge shows no cached freeze
+\* for the open epoch exists while counting, so it never applies here.)
+Cached(w) == IF S8bRules /\ gateDisabled THEN Min(frozenVal[w], Matured(w)) ELSE frozenVal[w]
+
 \* what the gate freezes / has frozen for the core's active challenge (_freeze)
-GateValue(w) == IF frozenEpoch[w] = active THEN frozenVal[w] ELSE Matured(w)
+GateValue(w) == IF frozenEpoch[w] = active
+                THEN (IF active = latest THEN Cached(w) ELSE frozenVal[w])
+                ELSE Matured(w)
 \* _frozenPreview(w) for latestChallengeId (eligibilityOf / previewSubmit)
-Preview(w)   == IF frozenEpoch[w] = latest THEN frozenVal[w] ELSE Matured(w)
+Preview(w)   == IF frozenEpoch[w] = latest THEN Cached(w) ELSE Matured(w)
 
 \* live stake a lock can be paid from (_settleLock "available")
 Live(w) == IF backer[w] = NoD THEN 0 ELSE Min(assignedOf[w], assignedBy[backer[w]])
@@ -151,7 +178,7 @@ Counting == wired /\ ~retired /\ (~gateDisabled \/ CurveEnabled)
 
 \* ghost attribution of counted stake to depositors
 RemCounted(d, w) ==
-    IF remEpoch[d] = latest /\ pendingEpoch[w] = latest /\ latest # holdWaived
+    IF remEpoch[d] = latest /\ pendingEpoch[w] = latest /\ RemovalsCount
     THEN remBy[d][w] ELSE 0
 CountedFrom(d) ==
     (IF assignee[d] # NoW THEN assignedBy[d] - PendByCur(d) ELSE 0)
@@ -188,6 +215,8 @@ Init ==
     /\ inGap = FALSE /\ gapAllWaiting = FALSE /\ gapSubmit = FALSE
     /\ ungatedCutover = FALSE /\ ungatedCutoverInWaiting = FALSE
     /\ baseEpoch = 0 /\ baseline = [w \in Wallets |-> 0] /\ rewiredSame = FALSE
+    /\ approvedBacker = [w \in Wallets |-> NoD]
+    /\ withdrawLocked = [d \in Depositors |-> FALSE]
 
 -----------------------------------------------------------------------------
 (* Core: challenge clock                                                    *)
@@ -199,14 +228,15 @@ SeedReady ==
     /\ gapAllWaiting' = (gapAllWaiting /\ ~inGap)
     /\ UNCHANGED <<stopped, minted, active, power, sunset, everAttached, oldRetained,
                    modVars, ledgerVars, freezeVars, bookVars, nftVars, ghostVars,
-                   inGap, gapSubmit, ungatedCutover, ungatedCutoverInWaiting, baseVars>>
+                   inGap, gapSubmit, ungatedCutover, ungatedCutoverInWaiting, baseVars, s8bVars>>
 
 \* more than 256 parent blocks since the seed block
 Expire ==
     /\ ~stopped /\ ~Ended /\ cstate = "Active"
     /\ cstate' = "Expired"
     /\ UNCHANGED <<stopped, minted, active, power, sunset, everAttached, oldRetained,
-                   modVars, ledgerVars, freezeVars, bookVars, nftVars, ghostVars, gapVars, baseVars>>
+                   modVars, ledgerVars, freezeVars, bookVars, nftVars, ghostVars, gapVars, baseVars,
+                   s8bVars>>
 
 \* refreshExpiredSeed: new id; the wired module snapshots it
 Refresh ==
@@ -220,13 +250,14 @@ Refresh ==
        ELSE UNCHANGED <<latest, wired, retired>>
     /\ UNCHANGED <<stopped, minted, power, sunset, everAttached, oldRetained,
                    gateDisabled, holdWaived, ledgerVars, freezeVars, bookVars, nftVars,
-                   ghostVars, gapVars, baseVars>>
+                   ghostVars, gapVars, baseVars, s8bVars>>
 
 SunsetPass ==
     /\ CoreChurn
     /\ ~sunset /\ sunset' = TRUE
     /\ UNCHANGED <<cstate, stopped, minted, active, power, everAttached, oldRetained,
-                   modVars, ledgerVars, freezeVars, bookVars, nftVars, ghostVars, gapVars, baseVars>>
+                   modVars, ledgerVars, freezeVars, bookVars, nftVars, ghostVars, gapVars, baseVars,
+                   s8bVars>>
 
 -----------------------------------------------------------------------------
 (* Core: submitProof(w) — gate, digest check, counters, onProofAccepted     *)
@@ -293,7 +324,7 @@ Submit(w) ==
     /\ cstate' = "Waiting"
     /\ owner' = [owner EXCEPT ![minted + 1] = w]
     /\ UNCHANGED <<stopped, power, sunset, everAttached, oldRetained, beneficiary,
-                   netIn, releaseCount, releasedTo, remBy, remEpoch, baseVars>>
+                   netIn, releaseCount, releasedTo, remBy, remEpoch, baseVars, s8bVars>>
 
 -----------------------------------------------------------------------------
 (* Core: setMiningPower / attachMiningPowerLate / stopMining                *)
@@ -318,7 +349,7 @@ DetachTx ==
     /\ gapSubmit' = FALSE
     /\ UNCHANGED <<cstate, stopped, minted, active, sunset, everAttached, oldRetained,
                    retired, gateDisabled, latest, ledgerVars, freezeVars, bookVars, nftVars,
-                   ghostVars, ungatedCutover, ungatedCutoverInWaiting>>
+                   ghostVars, ungatedCutover, ungatedCutoverInWaiting, s8bVars>>
 
 \* snapshotChallenge(active) on a module that is not wired
 AttachNewGuard == totalAssigned = 0                     \* RetainedAssignments
@@ -341,7 +372,7 @@ AttachTx(x) ==
     /\ ungatedCutoverInWaiting' = (ungatedCutoverInWaiting \/ (inGap /\ gapSubmit /\ gapAllWaiting))
     /\ UNCHANGED <<cstate, stopped, minted, active, sunset, gateDisabled, holdWaived,
                    ledgerVars, freezeVars, bookVars, nftVars, ghostVars,
-                   gapAllWaiting, gapSubmit, baseEpoch, baseline>>
+                   gapAllWaiting, gapSubmit, baseEpoch, baseline, s8bVars>>
 
 \* setMiningPower(0); setMiningPower(x) in ONE transaction (multiSend batch).
 \* If the attach reverts the whole batch reverts (guard false).
@@ -369,7 +400,7 @@ Cutover(x) ==
     /\ power' = x
     /\ everAttached' = TRUE
     /\ UNCHANGED <<cstate, stopped, minted, active, sunset, gateDisabled,
-                   ledgerVars, freezeVars, bookVars, nftVars, ghostVars, gapVars>>
+                   ledgerVars, freezeVars, bookVars, nftVars, ghostVars, gapVars, s8bVars>>
 
 \* attachMiningPowerLate: one-time, sunset-independent, only a fresh OLD-type
 \* custody (PrefundedMiningPower lacks curveUnit(), so it can never use this path)
@@ -378,7 +409,8 @@ LateAttachOld ==
     /\ ~everAttached /\ ~stopped /\ ~Ended /\ power = "None" /\ ~oldRetained
     /\ power' = "Old" /\ everAttached' = TRUE
     /\ UNCHANGED <<cstate, stopped, minted, active, sunset, oldRetained,
-                   modVars, ledgerVars, freezeVars, bookVars, nftVars, ghostVars, gapVars, baseVars>>
+                   modVars, ledgerVars, freezeVars, bookVars, nftVars, ghostVars, gapVars, baseVars,
+                   s8bVars>>
 
 StopMining ==
     /\ CanSetPower
@@ -388,7 +420,7 @@ StopMining ==
        ELSE UNCHANGED <<wired, retired, holdWaived>>
     /\ UNCHANGED <<cstate, minted, active, power, sunset, everAttached, oldRetained,
                    gateDisabled, latest, ledgerVars, freezeVars, bookVars, nftVars,
-                   ghostVars, gapVars, baseVars>>
+                   ghostVars, gapVars, baseVars, s8bVars>>
 
 \* abstract old-custody users: assign while it is wired, all exit while it is not
 OldUsers ==
@@ -396,7 +428,8 @@ OldUsers ==
     /\ \/ power = "Old" /\ ~oldRetained /\ oldRetained' = TRUE
        \/ power # "Old" /\ oldRetained /\ oldRetained' = FALSE
     /\ UNCHANGED <<cstate, stopped, minted, active, power, sunset, everAttached,
-                   modVars, ledgerVars, freezeVars, bookVars, nftVars, ghostVars, gapVars, baseVars>>
+                   modVars, ledgerVars, freezeVars, bookVars, nftVars, ghostVars, gapVars, baseVars,
+                   s8bVars>>
 
 -----------------------------------------------------------------------------
 (* Module: stake ledger                                                     *)
@@ -412,7 +445,8 @@ Deposit(d, a) ==
     /\ UNCHANGED <<coreVars, modVars, assignedOf, assignedBy, assignee, backer,
                    pendingOf, pendingEpoch, pendingBy, pendingEpochBy, removing, heldBy, heldEpochBy,
                    freezeVars, totalAssigned, totalCommitted, lock, nftVars,
-                   gated, lockWrites, releaseCount, releasedTo, remBy, remEpoch, gapVars, baseVars>>
+                   gated, lockWrites, releaseCount, releasedTo, remBy, remEpoch, gapVars, baseVars,
+                   s8bVars>>
 
 Assign(d, w, a) ==
     LET stale   == pendingEpoch[w] < latest
@@ -425,6 +459,8 @@ Assign(d, w, a) ==
     /\ a \in 1..unassigned[d]                                \* InsufficientUnassigned
     /\ assignee[d] \in {NoW, w}                              \* MustUnassignFirst
     /\ ~(assignedOf[w] # 0 /\ backer[w] # d)                 \* WalletAlreadyBacked
+    /\ (S8bRules /\ assignedOf[w] = 0) =>                    \* taking an empty slot (S8b)
+          approvedBacker[w] = d                              \* BackerNotApproved
     /\ (S8Rules /\ assignedOf[w] = 0) =>                     \* taking an empty slot (S8)
           /\ a >= MinStake                                   \* FirstAssignBelowMinimum
           /\ ~(pendingEpoch[w] = latest /\ removing[w] # 0    \* WalletHasCountingRemoval
@@ -443,7 +479,7 @@ Assign(d, w, a) ==
     /\ assignee' = [assignee EXCEPT ![d] = w]
     /\ backer' = [backer EXCEPT ![w] = d]
     /\ UNCHANGED <<coreVars, modVars, freezeVars, totalStake, totalCommitted, balance, lock,
-                   nftVars, ghostVars, gapVars, baseVars>>
+                   nftVars, ghostVars, gapVars, baseVars, s8bVars>>
 
 \* _unassignFrom(d, w, a): shared by unassign and evictBacker
 UnassignFrom(d, w, a) ==
@@ -479,15 +515,29 @@ Unassign(d, w, a) ==
     /\ assignee[d] = w                                       \* WrongAssignee
     /\ a \in 1..assignedBy[d]                                \* InsufficientAssigned
     /\ UnassignFrom(d, w, a)
+    /\ UNCHANGED s8bVars
 
 \* evictBacker (S8): the mining wallet removes a backer whose stake on it is
 \* below MIN_STAKE; unassign bookkeeping for the whole assignment, no cooldown
+\* check on the eviction itself. S8b: the backer's own cooldown carries over to
+\* its withdrawals (withdrawLockedUntil raised, modelled as withdrawLocked =
+\* TRUE; "already elapsed" is Evict followed at once by CooldownElapses), and a
+\* standing approval of the evicted backer is revoked.
 EvictBacker(w) ==
+    LET b == backer[w] IN
     /\ S8Rules
     /\ 0 < assignedOf[w] /\ assignedOf[w] < MinStake          \* BackerNotEvictable
-    /\ UnassignFrom(backer[w], w, assignedOf[w])
+    /\ UnassignFrom(b, w, assignedOf[w])
+    /\ IF S8bRules
+       THEN /\ withdrawLocked' = [withdrawLocked EXCEPT ![b] = TRUE]
+            /\ approvedBacker' = [approvedBacker EXCEPT ![w] = IF @ = b THEN NoD ELSE @]
+       ELSE UNCHANGED s8bVars
+
+\* S8b: CooldownNotMet(withdrawLockedUntil) unless retired / failsafe fired
+WithdrawLockApplies(d) == withdrawLocked[d] /\ ~retired /\ ~gateDisabled
 
 Withdraw(d, a) ==
+    /\ S8bRules => ~WithdrawLockApplies(d)                    \* CooldownNotMet (eviction)
     /\ a \in 1..(unassigned[d] - Min(Held(d), unassigned[d]))   \* StakeHeldUntilNextChallenge
     /\ unassigned' = [unassigned EXCEPT ![d] = @ - a]
     /\ totalStake' = totalStake - a
@@ -496,13 +546,33 @@ Withdraw(d, a) ==
     /\ UNCHANGED <<coreVars, modVars, assignedOf, assignedBy, assignee, backer,
                    pendingOf, pendingEpoch, pendingBy, pendingEpochBy, removing, heldBy, heldEpochBy,
                    freezeVars, totalAssigned, totalCommitted, lock, nftVars,
-                   gated, lockWrites, releaseCount, releasedTo, remBy, remEpoch, gapVars, baseVars>>
+                   gated, lockWrites, releaseCount, releasedTo, remBy, remEpoch, gapVars, baseVars,
+                   s8bVars>>
 
-\* failsafe guardian, one-way
+\* failsafe guardian, one-way. S8b also records holdWaivedEpoch = latest (as a
+\* detach does); the permanent part of the fix is RemovalsCount / Cached.
 DisableRequirement ==
     /\ ~gateDisabled /\ gateDisabled' = TRUE
-    /\ UNCHANGED <<coreVars, wired, retired, latest, holdWaived, ledgerVars, freezeVars,
-                   bookVars, nftVars, ghostVars, gapVars, baseVars>>
+    /\ holdWaived' = IF S8bRules THEN latest ELSE holdWaived
+    /\ UNCHANGED <<coreVars, wired, retired, latest, ledgerVars, freezeVars,
+                   bookVars, nftVars, ghostVars, gapVars, baseVars, s8bVars>>
+
+\* approveBacker(d) called by mining wallet w (S8b). d = NoD clears. Allowed in
+\* every state; moves nothing. Self-approval (SelfAssignment) is vacuous here
+\* because Depositors and Wallets are disjoint. Enabled for S8bRules = FALSE
+\* too: there it records the wallet's intent, which the SPEC/S8 rules ignore
+\* (checks/UnsolicitedBacker.cfg shows the capture).
+ApproveBacker(w, d) ==
+    /\ d \in Depositors \cup {NoD} /\ d # approvedBacker[w]
+    /\ approvedBacker' = [approvedBacker EXCEPT ![w] = d]
+    /\ UNCHANGED <<coreVars, modVars, ledgerVars, freezeVars, bookVars, nftVars,
+                   ghostVars, gapVars, baseVars, withdrawLocked>>
+
+\* block.timestamp passes withdrawLockedUntil[d] (S8b; time abstracted)
+CooldownElapses(d) ==
+    /\ withdrawLocked[d] /\ withdrawLocked' = [withdrawLocked EXCEPT ![d] = FALSE]
+    /\ UNCHANGED <<coreVars, modVars, ledgerVars, freezeVars, bookVars, nftVars,
+                   ghostVars, gapVars, baseVars, approvedBacker>>
 
 -----------------------------------------------------------------------------
 (* NFT: transfer (sale / loan default / hunt), burn, claim                   *)
@@ -518,7 +588,7 @@ Burn(t, h) ==
     /\ owner' = [owner EXCEPT ![t] = "burned"]
     /\ beneficiary' = [beneficiary EXCEPT ![t] = h]
     /\ UNCHANGED <<coreVars, modVars, ledgerVars, freezeVars, bookVars,
-                   ghostVars, gapVars, baseVars>>
+                   ghostVars, gapVars, baseVars, s8bVars>>
 
 \* claimCommitted by caller c
 Claim(t, c) ==
@@ -532,7 +602,7 @@ Claim(t, c) ==
     /\ releaseCount' = [releaseCount EXCEPT ![t] = @ + 1]
     /\ releasedTo' = [releasedTo EXCEPT ![t] = c]
     /\ UNCHANGED <<coreVars, modVars, ledgerVars, freezeVars, totalStake, totalAssigned,
-                   nftVars, netIn, gated, lockWrites, remBy, remEpoch, gapVars, baseVars>>
+                   nftVars, netIn, gated, lockWrites, remBy, remEpoch, gapVars, baseVars, s8bVars>>
 
 -----------------------------------------------------------------------------
 Next ==
@@ -542,6 +612,8 @@ Next ==
     \/ \E x \in IF CoreChurn THEN {"Old", "New"} ELSE {"New"} : AttachTx(x) \/ Cutover(x)
     \/ LateAttachOld \/ StopMining \/ OldUsers \/ DisableRequirement
     \/ \E w \in Wallets : EvictBacker(w)
+    \/ \E w \in Wallets, d \in Depositors \cup {NoD} : ApproveBacker(w, d)
+    \/ \E d \in Depositors : CooldownElapses(d)
     \/ \E d \in Depositors, a \in 1..MaxDeposit :
           Deposit(d, a) \/ Withdraw(d, a) \/ \E w \in Wallets : Assign(d, w, a) \/ Unassign(d, w, a)
     \/ \E t \in Tokens : \E h \in Holders : Burn(t, h) \/ Claim(t, h)
@@ -578,6 +650,9 @@ TypeOK ==
     /\ \A t \in Tokens : owner[t] \in Holders \cup {"none", "burned"}
     /\ \A w \in Wallets : PendOfCur(w) <= assignedOf[w]
     /\ \A d \in Depositors : PendByCur(d) <= assignedBy[d]
+    /\ approvedBacker \in [Wallets -> Depositors \cup {NoD}]
+    /\ withdrawLocked \in [Depositors -> BOOLEAN]
+    /\ ~S8bRules => \A d \in Depositors : ~withdrawLocked[d]
 
 \* the module the core reads is wired and tracks the core's challenge id
 WiredTracksCore ==
@@ -696,6 +771,22 @@ PostSunsetPermanent ==
           /\ (stopped' = stopped)
           /\ (power' # power) => (power = "None" /\ power' = "Old" /\ ~everAttached) ]_vars
 
+\* OnlyApprovedBackerTakesEmptySlot (S8b, review #3): on EVERY step, a wallet
+\* whose slot was empty (assignedOf = 0) and becomes backed is backed by the
+\* depositor the wallet had approved in the pre-state. So a front-runner can
+\* never take the slot the wallet meant for someone else (or for nobody).
+OnlyApprovedBackerTakesEmptySlot ==
+    [][ \A w \in Wallets :
+          (assignedOf[w] = 0 /\ assignedOf'[w] > 0) =>
+              (approvedBacker[w] # NoD /\ backer'[w] = approvedBacker[w]) ]_vars
+
+\* EvictedStakeNotWithdrawnBeforeCooldown (S8b, review #6): no step moves stake
+\* out of the module to a depositor (netIn falls, that depositor's unassigned
+\* balance falls) while its eviction lock runs, unless retired / failsafe.
+EvictedStakeNotWithdrawnBeforeCooldown ==
+    [][ \A d \in Depositors :
+          (netIn' < netIn /\ unassigned'[d] < unassigned[d]) => ~WithdrawLockApplies(d) ]_vars
+
 \* locks are never rewritten, releases never undone
 LocksMonotone ==
     [][ \A t \in Tokens : /\ lock[t].amount > 0 => lock'[t].amount = lock[t].amount
@@ -753,6 +844,15 @@ ViewMap ==
       inGap, IF inGap THEN <<gapAllWaiting, gapSubmit>> ELSE <<>>,
       ungatedCutover, ungatedCutoverInWaiting,
       \* baseline is read only while latest = baseEpoch (latest never decreases)
-      IF Cur(baseEpoch) THEN <<baseline, rewiredSame>> ELSE <<>>>>
+      IF Cur(baseEpoch) THEN <<baseline, rewiredSame>> ELSE <<>>,
+      \* S8b state. approvedBacker is read only by assign (and by
+      \* OnlyApprovedBackerTakesEmptySlot on an assign step); withdrawLocked
+      \* only by withdraw while ~retired /\ ~gateDisabled. Both retired and
+      \* gateDisabled are permanent here (retirement needs mint-out or stop,
+      \* after which nothing re-wires), and assign is refused under either,
+      \* so once one holds both are dead state and are projected out. With
+      \* S8bRules = FALSE approvedBacker is never read by a guard (the
+      \* property is checked in that mode only without a VIEW).
+      IF S8bRules /\ ~retired /\ ~gateDisabled THEN <<approvedBacker, withdrawLocked>> ELSE <<>>>>
 Symm == Permutations(Depositors) \cup Permutations(Wallets)
 =============================================================================
