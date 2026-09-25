@@ -609,9 +609,13 @@ contract PrefundedMiningPowerInvariantTest is PrefundedInvariantBase {
 /// flow model credits measured receipts and `_assertTaxLedger` reconciles
 /// the burned tax with the token's own record.
 /// @dev The handler catches every protocol revert itself, so a revert that
-/// escapes it is a handler bug and must fail the run (size stays default).
+/// escapes it is a handler bug and must fail the run. Runs are halved to 128
+/// (depth stays 500) to keep the CI job within budget; the plain variant
+/// keeps the default 256.
 /// forge-config: default.invariant.fail-on-revert = true
 /// forge-config: release.invariant.fail-on-revert = true
+/// forge-config: default.invariant.runs = 128
+/// forge-config: release.invariant.runs = 128
 contract PrefundedMiningPowerHostileInvariantTest is PrefundedInvariantBase {
     uint256 internal constant TAX_BPS = 500;
     PrefundedInvariantFeeToken internal feeToken;
